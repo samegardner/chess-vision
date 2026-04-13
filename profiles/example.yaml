@@ -1,0 +1,9 @@
+# Example calibration profile
+# Created by: chess-vision calibrate --name "example"
+
+name: example
+created_at: "2026-04-13"
+occupancy_model: profiles/example/occupancy.onnx
+piece_model: profiles/example/piece.onnx
+square_images_dir: profiles/example/squares/
+notes: "Example profile for reference. Replace with a real calibration."

@@ -1,0 +1,30 @@
+# Board detection
+board:
+  warp_size: 800           # Output size of warped board image (px)
+  context_padding: 0.5     # Extra padding around each square crop (50%)
+
+# CNN inference
+model:
+  occupancy_threshold: 0.5
+  piece_confidence_threshold: 0.6
+  input_size: 224          # CNN input size (ImageNet standard)
+
+# Move detection
+detection:
+  diff_threshold: 30       # Pixel intensity change threshold
+  stability_frames: 5      # Consecutive stable frames before accepting move
+  frame_interval: 0.5      # Seconds between captures during recording
+
+# Camera
+camera:
+  device_index: 0
+  width: 1920
+  height: 1080
+
+# Training
+training:
+  batch_size: 32
+  epochs: 20
+  learning_rate: 0.001
+  finetune_epochs: 30
+  finetune_learning_rate: 0.0001
