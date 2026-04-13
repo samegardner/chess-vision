@@ -37,6 +37,9 @@ def main():
         if not cap.isOpened():
             print(f"Could not open camera {args.camera}")
             return
+        print("Warming up camera...")
+        for _ in range(30):
+            cap.read()
         ret, frame = cap.read()
         cap.release()
         if not ret:

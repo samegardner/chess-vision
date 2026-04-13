@@ -303,17 +303,19 @@ def select_corners(image: np.ndarray) -> np.ndarray:
         if display_size:
             show = cv2.resize(display, display_size)
         cv2.imshow(window_name, show)
-        key = cv2.waitKey(50) & 0xFF
 
+        if len(corners) == 4:
+            # Show the completed outline, then close
+            cv2.waitKey(800)
+            break
+
+        key = cv2.waitKey(30) & 0xFF
         if key == ord("r"):
             corners.clear()
             _draw()
         elif key == ord("q"):
-            cv2.destroyWindow(window_name)
+            cv2.destroyAllWindows()
             raise KeyboardInterrupt("Corner selection cancelled")
-        elif len(corners) == 4:
-            cv2.waitKey(500)  # Brief pause to show the complete outline
-            break
 
-    cv2.destroyWindow(window_name)
+    cv2.destroyAllWindows()
     return np.array(corners, dtype=np.float32)

@@ -11,12 +11,12 @@ from chess_vision.training.augment import get_eval_transforms
 from chess_vision.config import INPUT_SIZE
 
 
-def _prepare_batch(square_images: list[np.ndarray]) -> np.ndarray:
+def _prepare_batch(square_images: list[np.ndarray], input_size: int = INPUT_SIZE) -> np.ndarray:
     """Convert list of BGR numpy images to a normalized float32 batch.
 
     Returns (N, 3, H, W) float32 array suitable for ONNX inference.
     """
-    transform = get_eval_transforms()
+    transform = get_eval_transforms(size=input_size)
     tensors = []
     for img in square_images:
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -38,8 +38,12 @@ def classify_board(
     """
     assert len(square_images) == 64
 
+    # Detect input size from ONNX model (handles both 100x100 and 224x224 models)
+    occ_input_shape = occupancy_model.session.get_inputs()[0].shape
+    input_size = occ_input_shape[2] if isinstance(occ_input_shape[2], int) else INPUT_SIZE
+
     # Stage 1: occupancy classification on all 64 squares
-    batch = _prepare_batch(square_images)
+    batch = _prepare_batch(square_images, input_size=input_size)
     occ_logits = occupancy_model.predict(batch)  # (64, 1)
     occ_probs = 1 / (1 + np.exp(-occ_logits.flatten()))  # sigmoid
     occupied = occ_probs > occupancy_threshold
@@ -50,7 +54,7 @@ def classify_board(
 
     if occupied_indices:
         occ_images = [square_images[i] for i in occupied_indices]
-        piece_batch = _prepare_batch(occ_images)
+        piece_batch = _prepare_batch(occ_images, input_size=input_size)
         piece_logits = piece_model.predict(piece_batch)  # (N, 12)
         pred_classes = np.argmax(piece_logits, axis=1)
 

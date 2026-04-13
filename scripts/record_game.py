@@ -72,12 +72,15 @@ def main():
     occ = ONNXClassifier(occ_path)
     piece = ONNXClassifier(piece_path)
 
-    # Open camera
+    # Open camera with warmup for auto-exposure
     cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
         print(f"Could not open camera {args.camera}")
         return
 
+    print("Warming up camera (auto-exposure)...")
+    for _ in range(30):  # Read ~30 frames to let auto-exposure settle
+        cap.read()
     ret, frame = cap.read()
     if not ret:
         print("Failed to capture frame")
