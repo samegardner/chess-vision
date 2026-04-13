@@ -12,6 +12,7 @@ def extract_squares(
     """Extract 64 square images with contextual padding.
 
     Squares are indexed 0-63: a1=0, b1=1, ..., h1=7, a2=8, ..., h8=63.
+    The warped board has rank 8 at the top (row 0) and rank 1 at the bottom.
 
     Args:
         warped_board: Top-down board image (WARP_SIZE x WARP_SIZE).
@@ -20,7 +21,33 @@ def extract_squares(
     Returns:
         List of 64 square images.
     """
-    raise NotImplementedError
+    h, w = warped_board.shape[:2]
+    sq_h = h / 8
+    sq_w = w / 8
+    pad_h = sq_h * padding
+    pad_w = sq_w * padding
+
+    squares = []
+    # rank 1 (bottom of image) to rank 8 (top of image)
+    for rank in range(8):
+        for file in range(8):
+            # Rank 1 = bottom of image = row 7, rank 8 = top = row 0
+            row = 7 - rank
+            col = file
+
+            # Center of this square
+            cy = row * sq_h + sq_h / 2
+            cx = col * sq_w + sq_w / 2
+
+            # Padded bounding box, clamped to image bounds
+            y1 = max(0, int(cy - sq_h / 2 - pad_h))
+            y2 = min(h, int(cy + sq_h / 2 + pad_h))
+            x1 = max(0, int(cx - sq_w / 2 - pad_w))
+            x2 = min(w, int(cx + sq_w / 2 + pad_w))
+
+            squares.append(warped_board[y1:y2, x1:x2].copy())
+
+    return squares
 
 
 def square_index_to_name(index: int) -> str:
