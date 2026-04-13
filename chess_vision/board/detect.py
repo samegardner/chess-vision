@@ -283,7 +283,7 @@ def select_corners(image: np.ndarray) -> np.ndarray:
                 cv2.line(display, corners[3], corners[0], (0, 255, 0), 2)
 
         remaining = 4 - len(corners)
-        msg = f"Click {remaining} more corner(s)" if remaining > 0 else "Done! Press any key."
+        msg = f"Click {remaining} more corner(s)" if remaining > 0 else "Done!"
         cv2.putText(display, msg, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
     def _on_click(event, x, y, flags, param):
@@ -305,8 +305,6 @@ def select_corners(image: np.ndarray) -> np.ndarray:
         cv2.imshow(window_name, show)
 
         if len(corners) == 4:
-            # Show the completed outline, then close
-            cv2.waitKey(800)
             break
 
         key = cv2.waitKey(30) & 0xFF
