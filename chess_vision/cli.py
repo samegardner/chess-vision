@@ -82,12 +82,13 @@ def calibrate(name: str, camera: int):
 @click.option("--white", default="White", help="White player name.")
 @click.option("--black", default="Black", help="Black player name.")
 @click.option("--interval", default=0.5, help="Seconds between frame captures.")
-def record(profile: str, output: str, camera: int, white: str, black: str, interval: float):
+@click.option("--auto-detect", is_flag=True, help="Use auto board detection instead of manual corner selection.")
+def record(profile: str, output: str, camera: int, white: str, black: str, interval: float, auto_detect: bool):
     """Record a chess game and save as PGN."""
     from chess_vision.inference.camera import Camera
     from chess_vision.inference.onnx_runtime import ONNXClassifier
     from chess_vision.inference.classify import classify_board, board_to_fen
-    from chess_vision.board.detect import detect_board
+    from chess_vision.board.detect import detect_board, select_corners
     from chess_vision.board.warp import compute_homography, warp_board
     from chess_vision.board.squares import extract_squares, remap_board_state
     from chess_vision.game.state import GameState
@@ -123,13 +124,17 @@ def record(profile: str, output: str, camera: int, white: str, black: str, inter
     click.echo()
 
     with Camera(device_index=camera) as cam:
-        # Initial board detection and orientation
-        click.echo("Detecting board...")
         frame = cam.capture()
-        corners = detect_board(frame)
-        if corners is None:
-            click.echo("Error: Could not detect board. Ensure the board is visible.")
-            return
+
+        if auto_detect:
+            click.echo("Auto-detecting board...")
+            corners = detect_board(frame)
+            if corners is None:
+                click.echo("Auto-detection failed. Falling back to manual corner selection.")
+                corners = select_corners(frame)
+        else:
+            click.echo("Select the 4 corners of the chessboard...")
+            corners = select_corners(frame)
 
         cached_homography = compute_homography(corners)
         warped = warp_board(frame, cached_homography)

@@ -5,7 +5,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from chess_vision.board.detect import detect_board
+from chess_vision.board.detect import detect_board, select_corners
 from chess_vision.board.warp import compute_homography, warp_board
 from chess_vision.board.squares import extract_squares, square_index_to_name
 from chess_vision.training.dataset import FEN_TO_PIECE_CLASS
@@ -45,10 +45,9 @@ def label_calibration_squares(
     for photo, is_white_view in [(white_photo, True), (black_photo, False)]:
         corners = detect_board(photo)
         if corners is None:
-            raise ValueError(
-                f"Could not detect board in {'white' if is_white_view else 'black'}-side photo. "
-                "Ensure the full board is visible with good contrast."
-            )
+            side = "white" if is_white_view else "black"
+            print(f"Auto-detection failed for {side}-side photo. Select corners manually.")
+            corners = select_corners(photo)
 
         H = compute_homography(corners)
         warped = warp_board(photo, H)
