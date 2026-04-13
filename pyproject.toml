@@ -12,6 +12,7 @@ dependencies = [
     "torchvision>=0.15",
     "onnx>=1.14",
     "onnxruntime>=1.16",
+    "onnxscript>=0.1",
     "opencv-python>=4.8",
     "python-chess>=1.10",
     "click>=8.1",

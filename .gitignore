@@ -14,6 +14,7 @@ venv/
 # Data and models (large files)
 data/chesscog/
 data/chessred/
+data/processed/
 data/raw/
 models/*.onnx
 models/checkpoints/

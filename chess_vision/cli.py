@@ -4,6 +4,8 @@ from pathlib import Path
 
 import click
 
+from chess_vision.config import DATA_DIR, MODELS_DIR
+
 
 @click.group()
 def main():
@@ -40,8 +42,74 @@ def record(profile: str, output: str, camera: int, white: str, black: str, inter
 @click.option("--batch-size", default=32, help="Batch size.")
 def train(stage: str, epochs: int, lr: float, batch_size: int):
     """Train models on public datasets (base) or calibration data (finetune)."""
-    click.echo(f"Training stage: {stage}")
-    click.echo("Not yet implemented.")
+    if stage == "base":
+        _train_base(epochs, lr, batch_size)
+    else:
+        click.echo("Use 'chess-vision calibrate' for fine-tuning.")
+
+
+def _train_base(epochs: int, lr: float, batch_size: int):
+    """Train base models on processed public datasets."""
+    from torch.utils.data import DataLoader
+
+    from chess_vision.models.occupancy import create_occupancy_model
+    from chess_vision.models.piece import create_piece_model
+    from chess_vision.models.export import export_to_onnx
+    from chess_vision.training.dataset import create_occupancy_dataset, create_piece_dataset
+    from chess_vision.training.augment import get_train_transforms, get_eval_transforms
+    from chess_vision.training.train import train_model
+
+    processed = DATA_DIR / "processed"
+    checkpoints = MODELS_DIR / "checkpoints"
+
+    train_tf = get_train_transforms()
+    eval_tf = get_eval_transforms()
+
+    # --- Occupancy model ---
+    occ_dir = processed / "occupancy"
+    if occ_dir.exists():
+        click.echo("Training occupancy model...")
+        occ_train = create_occupancy_dataset(occ_dir, "train", train_tf)
+        occ_val = create_occupancy_dataset(occ_dir, "val", eval_tf)
+        click.echo(f"  Train: {len(occ_train)} samples, Val: {len(occ_val)} samples")
+
+        model = create_occupancy_model(pretrained=True)
+        model = train_model(
+            model,
+            DataLoader(occ_train, batch_size=batch_size, shuffle=True, num_workers=4),
+            DataLoader(occ_val, batch_size=batch_size, num_workers=4),
+            epochs=epochs,
+            lr=lr,
+            output_dir=checkpoints,
+            model_name="occupancy",
+        )
+        export_to_onnx(model, MODELS_DIR / "occupancy.onnx")
+        click.echo(f"  Exported to {MODELS_DIR / 'occupancy.onnx'}")
+    else:
+        click.echo(f"No occupancy data at {occ_dir}. Run scripts/download_data.py first.")
+
+    # --- Piece model ---
+    piece_dir = processed / "pieces"
+    if piece_dir.exists():
+        click.echo("Training piece model...")
+        piece_train = create_piece_dataset(piece_dir, "train", train_tf)
+        piece_val = create_piece_dataset(piece_dir, "val", eval_tf)
+        click.echo(f"  Train: {len(piece_train)} samples, Val: {len(piece_val)} samples")
+
+        model = create_piece_model(pretrained=True)
+        model = train_model(
+            model,
+            DataLoader(piece_train, batch_size=batch_size, shuffle=True, num_workers=4),
+            DataLoader(piece_val, batch_size=batch_size, num_workers=4),
+            epochs=epochs,
+            lr=lr,
+            output_dir=checkpoints,
+            model_name="piece",
+        )
+        export_to_onnx(model, MODELS_DIR / "piece.onnx")
+        click.echo(f"  Exported to {MODELS_DIR / 'piece.onnx'}")
+    else:
+        click.echo(f"No piece data at {piece_dir}. Run scripts/download_data.py first.")
 
 
 @main.command()

@@ -18,4 +18,17 @@ def export_to_onnx(
         output_path: Where to save the .onnx file.
         input_size: Input tensor shape (batch, channels, height, width).
     """
-    raise NotImplementedError
+    model.eval()
+    model = model.cpu()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    dummy_input = torch.randn(*input_size)
+    batch_dim = torch.export.Dim("batch")
+    # dynamic_shapes keys must match the model's forward() arg name ("x" for ResNet)
+    torch.onnx.export(
+        model,
+        dummy_input,
+        str(output_path),
+        input_names=["input"],
+        output_names=["output"],
+        dynamic_shapes={"x": {0: batch_dim}},
+    )
