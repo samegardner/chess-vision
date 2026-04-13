@@ -27,6 +27,7 @@ from tqdm import tqdm
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from chess_vision.config import DATA_DIR
+from chess_vision.models.piece import PIECE_TO_FEN
 
 CHESSCOG_OSF_PROJECT = "xf3ka"
 CHESSRED_ANNOTATIONS_URL = "https://data.4tu.nl/file/99b5c721-280b-450b-b058-b2900b69a90f/3cae6364-daca-4967-b426-1e4b68cdb64c"
@@ -36,13 +37,8 @@ SQUARE_SIZE = 50
 BOARD_SIZE = 8 * SQUARE_SIZE
 IMG_SIZE = BOARD_SIZE + 2 * SQUARE_SIZE  # Extra margin for padding
 
-# Piece class names matching our model's PIECE_CLASSES
-FEN_TO_CLASS = {
-    "P": "white_pawn", "N": "white_knight", "B": "white_bishop",
-    "R": "white_rook", "Q": "white_queen", "K": "white_king",
-    "p": "black_pawn", "n": "black_knight", "b": "black_bishop",
-    "r": "black_rook", "q": "black_queen", "k": "black_king",
-}
+# Reverse of PIECE_TO_FEN: FEN char -> class name (e.g., "P" -> "white_pawn")
+FEN_TO_CLASS = {v: k for k, v in PIECE_TO_FEN.items()}
 
 
 def _download_file(url: str, dest: Path, desc: str = "") -> None:
@@ -256,21 +252,16 @@ def process_chessred(raw_dir: Path, output_dir: Path) -> None:
 
 
 def _normalize_category(cat_name: str) -> str | None:
-    """Normalize ChessReD category names to our piece class names."""
-    # ChessReD uses names like "white pawn", "black knight", etc.
-    normalized = cat_name.lower().replace(" ", "_").replace("-", "_")
-    if normalized in FEN_TO_CLASS.values():
+    """Normalize ChessReD category names to our piece class names.
+
+    ChessReD uses hyphenated names like "white-king", "black-pawn".
+    We need underscore-separated names like "white_king", "black_pawn".
+    """
+    normalized = cat_name.lower().strip().replace(" ", "_").replace("-", "_")
+    valid_classes = set(FEN_TO_CLASS.values())
+    if normalized in valid_classes:
         return normalized
-    # Try common variations
-    mappings = {
-        "white_rook": "white_rook", "white_knight": "white_knight",
-        "white_bishop": "white_bishop", "white_queen": "white_queen",
-        "white_king": "white_king", "white_pawn": "white_pawn",
-        "black_rook": "black_rook", "black_knight": "black_knight",
-        "black_bishop": "black_bishop", "black_queen": "black_queen",
-        "black_king": "black_king", "black_pawn": "black_pawn",
-    }
-    return mappings.get(normalized)
+    return None
 
 
 def download_chesscog(output_dir: Path = DATA_DIR / "chesscog") -> None:

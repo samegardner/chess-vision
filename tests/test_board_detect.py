@@ -104,13 +104,12 @@ class TestDetectBoard:
         """Board detection on a clean synthetic checkerboard."""
         board = _make_board_on_background(board_size=500, img_size=700)
         corners = detect_board(board)
-        # On a clean synthetic image, detection should succeed
-        if corners is not None:
-            assert corners.shape == (4, 2)
-            # Corners should be roughly at the board boundaries (100-600 range)
-            for corner in corners:
-                assert 50 < corner[0] < 650
-                assert 50 < corner[1] < 650
+        assert corners is not None, "Board detection failed on clean synthetic checkerboard"
+        assert corners.shape == (4, 2)
+        # Corners should be roughly at the board boundaries (100-600 range)
+        for corner in corners:
+            assert 50 < corner[0] < 650
+            assert 50 < corner[1] < 650
 
     def test_on_blank_image_returns_none(self):
         """Blank image should fail detection gracefully."""
@@ -122,9 +121,9 @@ class TestDetectBoard:
         """Line detection on a checkerboard should find two line groups."""
         board = _make_checkerboard(600)
         group_a, group_b = detect_lines(board)
-        # Should find lines in both directions
-        if len(group_a) > 0 and len(group_b) > 0:
-            # The two groups should have different dominant angles
-            avg_theta_a = np.mean([l[1] for l in group_a])
-            avg_theta_b = np.mean([l[1] for l in group_b])
-            assert abs(avg_theta_a - avg_theta_b) > 0.3  # At least ~17 degrees apart
+        assert len(group_a) > 0, "No lines detected in group A"
+        assert len(group_b) > 0, "No lines detected in group B"
+        # The two groups should have different dominant angles
+        avg_theta_a = np.mean([l[1] for l in group_a])
+        avg_theta_b = np.mean([l[1] for l in group_b])
+        assert abs(avg_theta_a - avg_theta_b) > 0.3  # At least ~17 degrees apart

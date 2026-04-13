@@ -14,39 +14,14 @@ from torch.utils.data import Dataset
 from torchvision.datasets import ImageFolder
 
 
+# Single source of truth for piece constants is models/piece.py
+from chess_vision.models.piece import PIECE_CLASSES, PIECE_TO_FEN
+
 # Label mappings
 OCCUPANCY_CLASSES = ["empty", "occupied"]
 
-PIECE_CLASSES = [
-    "white_pawn",
-    "white_knight",
-    "white_bishop",
-    "white_rook",
-    "white_queen",
-    "white_king",
-    "black_pawn",
-    "black_knight",
-    "black_bishop",
-    "black_rook",
-    "black_queen",
-    "black_king",
-]
-
-# FEN char to piece class name
-FEN_TO_PIECE_CLASS = {
-    "P": "white_pawn",
-    "N": "white_knight",
-    "B": "white_bishop",
-    "R": "white_rook",
-    "Q": "white_queen",
-    "K": "white_king",
-    "p": "black_pawn",
-    "n": "black_knight",
-    "b": "black_bishop",
-    "r": "black_rook",
-    "q": "black_queen",
-    "k": "black_king",
-}
+# Reverse mapping: FEN char -> class name
+FEN_TO_PIECE_CLASS = {v: k for k, v in PIECE_TO_FEN.items()}
 
 
 def create_occupancy_dataset(root: Path, split: str = "train", transform=None) -> ImageFolder:

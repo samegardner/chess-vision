@@ -50,6 +50,21 @@ def extract_squares(
     return squares
 
 
+def remap_board_state(board_state: dict[str, str | None]) -> dict[str, str | None]:
+    """Remap a board state from flipped orientation (black on bottom) to standard.
+
+    When the camera sees the board from Black's side, the warped image has
+    a8 at bottom-left instead of a1. This function swaps all square names
+    so the board state matches standard orientation (white on bottom).
+    """
+    remapped = {}
+    for sq_name, piece in board_state.items():
+        flipped_file = chr(ord("h") - (ord(sq_name[0]) - ord("a")))
+        flipped_rank = str(9 - int(sq_name[1]))
+        remapped[f"{flipped_file}{flipped_rank}"] = piece
+    return remapped
+
+
 def square_index_to_name(index: int) -> str:
     """Convert 0-63 index to algebraic notation (e.g., 0 -> 'a1')."""
     file = chr(ord("a") + index % 8)

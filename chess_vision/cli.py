@@ -89,7 +89,7 @@ def record(profile: str, output: str, camera: int, white: str, black: str, inter
     from chess_vision.inference.classify import classify_board, board_to_fen
     from chess_vision.board.detect import detect_board
     from chess_vision.board.warp import compute_homography, warp_board
-    from chess_vision.board.squares import extract_squares
+    from chess_vision.board.squares import extract_squares, remap_board_state
     from chess_vision.game.state import GameState
     from chess_vision.game.moves import MoveDetector
     from chess_vision.game.rules import resolve_move, detect_orientation
@@ -115,6 +115,7 @@ def record(profile: str, output: str, camera: int, white: str, black: str, inter
     game = GameState()
     detector = MoveDetector()
     cached_homography = None
+    flipped = False  # True if board is oriented with black on bottom
 
     click.echo("Starting recording. Press Ctrl+C to stop and save PGN.")
     click.echo(f"  Camera: {camera}, Interval: {interval}s")
@@ -138,6 +139,10 @@ def record(profile: str, output: str, camera: int, white: str, black: str, inter
         try:
             orientation = detect_orientation(board_state)
             click.echo(f"  Orientation: {orientation}")
+            if orientation == "white_top":
+                flipped = True
+                board_state = remap_board_state(board_state)
+                click.echo("  Board is flipped (black nearest camera). Remapping squares.")
         except ValueError:
             click.echo("  Warning: Could not auto-detect orientation, assuming white on bottom")
 
@@ -147,12 +152,18 @@ def record(profile: str, output: str, camera: int, white: str, black: str, inter
         try:
             while not game.is_game_over():
                 time.sleep(interval)
-                frame = cam.capture()
 
-                # Re-detect board periodically (every ~10 frames) or use cached homography
+                try:
+                    frame = cam.capture()
+                except RuntimeError as e:
+                    click.echo(f"  ! Camera error: {e}. Retrying...")
+                    continue
+
                 warped = warp_board(frame, cached_homography)
                 squares = extract_squares(warped)
                 board_state = classify_board(squares, occ_model, piece_model)
+                if flipped:
+                    board_state = remap_board_state(board_state)
 
                 changed = detector.detect_change(board_state)
                 if changed is None:
@@ -164,34 +175,34 @@ def record(profile: str, output: str, camera: int, white: str, black: str, inter
                     click.echo(f"  ? Unresolved change on squares: {changed}")
                     continue
 
+                # Get SAN before applying (board.san requires the move to be legal now)
+                san = game.board.san(move)
                 game.apply_move(move)
-                move_num = game.move_number()
-                san = game.board.san(move) if not game.board.is_game_over() else str(move)
 
                 # Print move
-                if game.board.turn:
+                if game.whose_turn() == "white":
                     # Black just moved
-                    click.echo(f"  {move_num - 1}... {game.board.peek().uci()}")
+                    click.echo(f"  {game.move_number() - 1}... {san}")
                 else:
                     # White just moved
-                    click.echo(f"  {move_num}. {game.board.peek().uci()}")
+                    click.echo(f"  {game.move_number()}. {san}")
 
         except KeyboardInterrupt:
             click.echo("\n\nRecording stopped.")
-
-    # Save PGN
-    result = game.result()
-    pgn_str = generate_pgn(
-        game.move_history,
-        white_name=white,
-        black_name=black,
-        result=result,
-    )
-    save_pgn(pgn_str, Path(output))
-    click.echo(f"\nGame saved to {output}")
-    click.echo(f"  Moves: {len(game.move_history)}")
-    click.echo(f"  Result: {result}")
-    click.echo(f"  FEN: {game.get_fen()}")
+        finally:
+            # Always save PGN, even on error
+            result = game.result()
+            pgn_str = generate_pgn(
+                game.move_history,
+                white_name=white,
+                black_name=black,
+                result=result,
+            )
+            save_pgn(pgn_str, Path(output))
+            click.echo(f"\nGame saved to {output}")
+            click.echo(f"  Moves: {len(game.move_history)}")
+            click.echo(f"  Result: {result}")
+            click.echo(f"  FEN: {game.get_fen()}")
 
 
 @main.command()
