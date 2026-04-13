@@ -9,7 +9,7 @@ class MoveDetector:
     def __init__(self, stability_frames: int = STABILITY_FRAMES):
         self.stability_frames = stability_frames
         self.previous_board: dict[str, str | None] | None = None
-        self.candidate_changes: list[str] | None = None
+        self.candidate_changes: set[str] | None = None
         self.stable_count: int = 0
 
     def set_initial_board(self, board_state: dict[str, str | None]) -> None:
@@ -38,16 +38,18 @@ class MoveDetector:
             self.stable_count = 0
             return None
 
-        if changed == self.candidate_changes:
+        changed_set = set(changed)
+        if changed_set == self.candidate_changes:
             self.stable_count += 1
         else:
-            self.candidate_changes = changed
+            self.candidate_changes = changed_set
             self.stable_count = 1
 
         if self.stable_count >= self.stability_frames:
             self.previous_board = dict(current_board)
+            result = sorted(self.candidate_changes)
             self.candidate_changes = None
             self.stable_count = 0
-            return changed
+            return result
 
         return None
