@@ -9,6 +9,13 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 
+def freeze_backbone(model: nn.Module) -> None:
+    """Freeze all layers except layer4 and fc (final block + classification head)."""
+    for name, param in model.named_parameters():
+        if not (name.startswith("layer4") or name.startswith("fc")):
+            param.requires_grad = False
+
+
 def train_model(
     model: nn.Module,
     train_loader: DataLoader,
@@ -18,6 +25,7 @@ def train_model(
     output_dir: Path = Path("models/checkpoints"),
     model_name: str = "model",
     patience: int = 5,
+    freeze: bool = False,
 ) -> nn.Module:
     """Train with Adam, cosine LR schedule, early stopping.
 
@@ -30,11 +38,18 @@ def train_model(
         output_dir: Directory for saving checkpoints.
         model_name: Name prefix for checkpoint files.
         patience: Early stopping patience (epochs without improvement).
+        freeze: If True, freeze early layers and only train layer4 + fc.
 
     Returns:
         Trained model with best validation weights loaded.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    if freeze:
+        freeze_backbone(model)
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in model.parameters())
+        print(f"  Frozen backbone: training {trainable:,}/{total:,} parameters ({trainable*100//total}%)")
 
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     model = model.to(device)
@@ -49,7 +64,9 @@ def train_model(
         criterion = nn.CrossEntropyLoss()
         is_binary = False
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    optimizer = torch.optim.Adam(
+        filter(lambda p: p.requires_grad, model.parameters()), lr=lr
+    )
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
 
     best_val_loss = float("inf")

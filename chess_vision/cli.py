@@ -212,20 +212,22 @@ def record(profile: str, output: str, camera: int, white: str, black: str, inter
 
 @main.command()
 @click.option("--stage", type=click.Choice(["base", "finetune"]), required=True)
-@click.option("--epochs", default=20, help="Number of training epochs.")
+@click.option("--epochs", default=10, help="Number of training epochs.")
 @click.option("--lr", default=1e-3, help="Learning rate.")
-@click.option("--batch-size", default=32, help="Batch size.")
-def train(stage: str, epochs: int, lr: float, batch_size: int):
+@click.option("--batch-size", default=64, help="Batch size.")
+@click.option("--fast", is_flag=True, help="Fast mode: freeze backbone, 128px input, larger batch, subsample data.")
+def train(stage: str, epochs: int, lr: float, batch_size: int, fast: bool):
     """Train models on public datasets (base) or calibration data (finetune)."""
     if stage == "base":
-        _train_base(epochs, lr, batch_size)
+        _train_base(epochs, lr, batch_size, fast)
     else:
         click.echo("Use 'chess-vision calibrate' for fine-tuning.")
 
 
-def _train_base(epochs: int, lr: float, batch_size: int):
+def _train_base(epochs: int, lr: float, batch_size: int, fast: bool):
     """Train base models on processed public datasets."""
-    from torch.utils.data import DataLoader
+    from torch.utils.data import DataLoader, Subset
+    import random
 
     from chess_vision.models.occupancy import create_occupancy_model
     from chess_vision.models.piece import create_piece_model
@@ -237,14 +239,28 @@ def _train_base(epochs: int, lr: float, batch_size: int):
     processed = DATA_DIR / "processed"
     checkpoints = MODELS_DIR / "checkpoints"
 
-    train_tf = get_train_transforms()
-    eval_tf = get_eval_transforms()
+    if fast:
+        img_size = 128
+        batch_size = max(batch_size, 128)
+        click.echo("Fast mode: 128px input, frozen backbone, larger batches")
+    else:
+        img_size = 224
+
+    train_tf = get_train_transforms(size=img_size)
+    eval_tf = get_eval_transforms(size=img_size)
+
+    def _maybe_subsample(dataset, max_samples=50000):
+        """In fast mode, subsample large datasets."""
+        if fast and len(dataset) > max_samples:
+            indices = random.sample(range(len(dataset)), max_samples)
+            return Subset(dataset, indices)
+        return dataset
 
     # --- Occupancy model ---
     occ_dir = processed / "occupancy"
     if occ_dir.exists():
         click.echo("Training occupancy model...")
-        occ_train = create_occupancy_dataset(occ_dir, "train", train_tf)
+        occ_train = _maybe_subsample(create_occupancy_dataset(occ_dir, "train", train_tf))
         occ_val = create_occupancy_dataset(occ_dir, "val", eval_tf)
         click.echo(f"  Train: {len(occ_train)} samples, Val: {len(occ_val)} samples")
 
@@ -257,6 +273,7 @@ def _train_base(epochs: int, lr: float, batch_size: int):
             lr=lr,
             output_dir=checkpoints,
             model_name="occupancy",
+            freeze=fast,
         )
         export_to_onnx(model, MODELS_DIR / "occupancy.onnx")
         click.echo(f"  Exported to {MODELS_DIR / 'occupancy.onnx'}")
@@ -267,7 +284,7 @@ def _train_base(epochs: int, lr: float, batch_size: int):
     piece_dir = processed / "pieces"
     if piece_dir.exists():
         click.echo("Training piece model...")
-        piece_train = create_piece_dataset(piece_dir, "train", train_tf)
+        piece_train = _maybe_subsample(create_piece_dataset(piece_dir, "train", train_tf))
         piece_val = create_piece_dataset(piece_dir, "val", eval_tf)
         click.echo(f"  Train: {len(piece_train)} samples, Val: {len(piece_val)} samples")
 
@@ -280,6 +297,7 @@ def _train_base(epochs: int, lr: float, batch_size: int):
             lr=lr,
             output_dir=checkpoints,
             model_name="piece",
+            freeze=fast,
         )
         export_to_onnx(model, MODELS_DIR / "piece.onnx")
         click.echo(f"  Exported to {MODELS_DIR / 'piece.onnx'}")
