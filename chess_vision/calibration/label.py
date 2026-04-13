@@ -1,10 +1,14 @@
 """Auto-label squares from starting position calibration photos."""
 
+from pathlib import Path
+
+import cv2
 import numpy as np
 
 from chess_vision.board.detect import detect_board
 from chess_vision.board.warp import compute_homography, warp_board
 from chess_vision.board.squares import extract_squares, square_index_to_name
+from chess_vision.training.dataset import FEN_TO_PIECE_CLASS
 
 # Known starting position: square name -> FEN piece character (None = empty)
 STARTING_POSITION: dict[str, str | None] = {
@@ -29,11 +33,67 @@ def label_calibration_squares(
     and assigns labels from the known starting position.
 
     Args:
-        white_photo: Photo with white pieces closest to camera.
-        black_photo: Photo with black pieces closest to camera.
+        white_photo: Photo with white pieces closest to camera (rank 1 nearest).
+        black_photo: Photo with black pieces closest to camera (rank 8 nearest).
 
     Returns:
         List of (square_image, label) tuples. Label is FEN char or None (empty).
         128 total (64 from each photo).
     """
-    raise NotImplementedError
+    results = []
+
+    for photo, is_white_view in [(white_photo, True), (black_photo, False)]:
+        corners = detect_board(photo)
+        if corners is None:
+            raise ValueError(
+                f"Could not detect board in {'white' if is_white_view else 'black'}-side photo. "
+                "Ensure the full board is visible with good contrast."
+            )
+
+        H = compute_homography(corners)
+        warped = warp_board(photo, H)
+        squares = extract_squares(warped)
+
+        for i, sq_img in enumerate(squares):
+            sq_name = square_index_to_name(i)
+
+            if is_white_view:
+                # White view: board is oriented normally (a1 bottom-left)
+                label = STARTING_POSITION[sq_name]
+            else:
+                # Black view: board is rotated 180 degrees
+                # a1 in the warped image actually shows h8, etc.
+                flipped_file = chr(ord("h") - (ord(sq_name[0]) - ord("a")))
+                flipped_rank = str(9 - int(sq_name[1]))
+                label = STARTING_POSITION[f"{flipped_file}{flipped_rank}"]
+
+            results.append((sq_img, label))
+
+    return results
+
+
+def save_calibration_squares(
+    labeled_squares: list[tuple[np.ndarray, str | None]],
+    output_dir: Path,
+) -> None:
+    """Save labeled squares to disk in ImageFolder format.
+
+    Creates subdirectories for each class (empty, white_pawn, etc.)
+    with individual square images as PNGs.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    counts: dict[str, int] = {}
+    for sq_img, label in labeled_squares:
+        if label is None:
+            class_name = "empty"
+        else:
+            class_name = FEN_TO_PIECE_CLASS[label]
+
+        class_dir = output_dir / class_name
+        class_dir.mkdir(exist_ok=True)
+
+        idx = counts.get(class_name, 0)
+        counts[class_name] = idx + 1
+
+        cv2.imwrite(str(class_dir / f"{class_name}_{idx:04d}.png"), sq_img)

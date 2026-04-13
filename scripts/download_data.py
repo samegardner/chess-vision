@@ -201,7 +201,9 @@ def process_chessred(raw_dir: Path, output_dir: Path) -> None:
         img_id = ann["image_id"]
         if img_id not in annotations:
             annotations[img_id] = {}
-        annotations[img_id][ann["square"]] = ann["category_id"]
+        sq_key = ann.get("chessboard_position") or ann.get("square")
+        if sq_key:
+            annotations[img_id][sq_key] = ann["category_id"]
 
     for split_name, split_info in data["splits"].items():
         img_ids = split_info["image_ids"]
