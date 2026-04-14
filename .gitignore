@@ -21,8 +21,9 @@ models/checkpoints/
 models/*.data
 models/piece_classes.json
 
-# Profiles
+# Profiles and game history
 profiles/
+games/
 
 # Temp images
 *.jpg

@@ -240,10 +240,36 @@ def main():
         cap.release()
         if not args.no_display:
             cv2.destroyAllWindows()
-        pgn = generate_pgn(move_history, white_name=args.white, black_name=args.black)
-        save_pgn(pgn, Path(args.output))
-        print(f"\nGame saved to {args.output} ({len(move_history)} moves)")
-        if move_history:
+
+        if not move_history:
+            print("\nNo moves recorded.")
+        else:
+            # Determine result
+            if board.is_checkmate():
+                result = "0-1" if board.turn == chess.WHITE else "1-0"
+            elif board.is_game_over():
+                result = "1/2-1/2"
+            else:
+                result = "*"
+
+            pgn = generate_pgn(move_history, white_name=args.white,
+                               black_name=args.black, result=result)
+
+            # Save to specified output
+            save_pgn(pgn, Path(args.output))
+
+            # Also save to games/ with timestamp
+            from datetime import datetime
+            games_dir = Path(__file__).parent.parent / "games"
+            games_dir.mkdir(exist_ok=True)
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+            game_file = games_dir / f"{timestamp}_{args.white}_vs_{args.black}.pgn"
+            save_pgn(pgn, game_file)
+
+            print(f"\nGame saved to:")
+            print(f"  {args.output}")
+            print(f"  {game_file}")
+            print(f"Moves: {len(move_history)} | Result: {result}")
             print(f"\nFinal position:")
             print(board)
             print(f"\nFEN: {board.fen()}")
