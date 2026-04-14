@@ -78,25 +78,25 @@ def draw_debug(frame, detections, square_centers, board, move_history, corners,
         cv2.putText(overlay, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
 
     # Move list panel (right side)
-    panel_w = 220
+    panel_w = 350
     panel = np.zeros((h, panel_w, 3), dtype=np.uint8)
-    panel[:] = (30, 30, 30)  # Dark background
+    panel[:] = (30, 30, 30)
 
     # Title
     turn = "White" if board.turn == chess.WHITE else "Black"
-    cv2.putText(panel, "Chess Vision", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-    cv2.putText(panel, f"Move {board.fullmove_number} | {turn}", (10, 60),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+    cv2.putText(panel, "Chess Vision", (15, 45), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 2)
+    cv2.putText(panel, f"Move {board.fullmove_number} | {turn}", (15, 85),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
 
     if hand_on_board:
-        cv2.putText(panel, "HAND DETECTED", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+        cv2.putText(panel, "HAND DETECTED", (15, 125), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
     # Move list
-    y_start = 120
-    line_height = 22
-    max_moves_shown = (h - y_start - 40) // line_height
+    y_start = 160
+    line_height = 35
+    max_moves_shown = (h - y_start - 60) // line_height
 
-    # Build move text pairs (1. e4 e5  2. Nf3 Nc6 ...)
+    # Build move text pairs
     move_lines = []
     temp_board = chess.Board()
     for i, move in enumerate(move_history):
@@ -107,21 +107,19 @@ def draw_debug(frame, detections, square_centers, board, move_history, corners,
         else:
             move_lines[-1] += f"  {san}"
 
-    # Show last N moves that fit
     if len(move_lines) > max_moves_shown:
         move_lines = move_lines[-max_moves_shown:]
 
     for i, line in enumerate(move_lines):
         y = y_start + i * line_height
-        # Highlight the last line
         if i == len(move_lines) - 1:
-            cv2.putText(panel, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
+            cv2.putText(panel, line, (15, y), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2)
         else:
-            cv2.putText(panel, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
+            cv2.putText(panel, line, (15, y), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (180, 180, 180), 1)
 
     # Move count at bottom
-    cv2.putText(panel, f"{len(move_history)} moves recorded", (10, h - 15),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (150, 150, 150), 1)
+    cv2.putText(panel, f"{len(move_history)} moves recorded", (15, h - 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (150, 150, 150), 1)
 
     # Combine frame + panel
     combined = np.hstack([overlay, panel])
