@@ -1,15 +1,15 @@
-"""Record a chess game.
+"""Record a chess game using pixel-based move detection.
 
-Uses a hybrid approach:
-1. Starting position is hardcoded (always the same)
-2. Pixel differencing detects WHICH squares changed
-3. CNN classifies changed squares to determine the new piece (or empty)
-4. python-chess validates which legal move matches
+No CNN needed. Uses pixel differencing to detect changed squares,
+then python-chess to find the matching legal move. Accepts partial
+matches (even a single changed square) when only one legal move
+involves that square.
 
 Usage:
     python scripts/record_game.py
     python scripts/record_game.py --select-corners
     python scripts/record_game.py --output mygame.pgn
+    python scripts/record_game.py --threshold 12
 """
 
 import argparse
@@ -25,12 +25,8 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from chess_vision.board.detect import select_corners
 from chess_vision.board.warp import compute_homography, warp_board
-from chess_vision.board.squares import extract_squares, square_index_to_name, name_to_square_index
-from chess_vision.inference.onnx_runtime import ONNXClassifier
-from chess_vision.inference.classify import _prepare_batch
 from chess_vision.game.pixel_moves import PixelMoveDetector
 from chess_vision.game.pgn import generate_pgn, save_pgn
-from chess_vision.config import MODELS_DIR
 
 CORNERS_FILE = Path(__file__).parent.parent / "corners.json"
 
@@ -47,106 +43,71 @@ def load_or_select_corners(frame, force_select=False):
     return corners
 
 
-def classify_square(
-    square_img: np.ndarray,
-    occ_model: ONNXClassifier,
-    piece_model: ONNXClassifier,
-    piece_class_order: list[str],
-    input_size: int,
-) -> str | None:
-    """Classify a single square. Returns FEN char or None (empty)."""
-    class_to_fen = {
-        "white_pawn": "P", "white_knight": "N", "white_bishop": "B",
-        "white_rook": "R", "white_queen": "Q", "white_king": "K",
-        "black_pawn": "p", "black_knight": "n", "black_bishop": "b",
-        "black_rook": "r", "black_queen": "q", "black_king": "k",
-    }
+def get_move_squares(move: chess.Move, board: chess.Board) -> set[str]:
+    """Get all squares a move touches (from, to, plus castling/en passant squares)."""
+    squares = {chess.square_name(move.from_square), chess.square_name(move.to_square)}
 
-    batch = _prepare_batch([square_img], input_size=input_size)
-    occ_logit = occ_model.predict(batch)[0, 0]
-    occ_prob = 1 / (1 + np.exp(-occ_logit))
+    if board.is_castling(move):
+        rank = "1" if board.turn == chess.WHITE else "8"
+        if board.is_kingside_castling(move):
+            squares.update({f"h{rank}", f"f{rank}"})
+        else:
+            squares.update({f"a{rank}", f"d{rank}"})
 
-    if occ_prob < 0.5:
-        return None
+    if board.is_en_passant(move):
+        cap_rank = "5" if board.turn == chess.WHITE else "4"
+        cap_file = chess.square_name(move.to_square)[0]
+        squares.add(f"{cap_file}{cap_rank}")
 
-    piece_logits = piece_model.predict(batch)[0]
-    pred_class = piece_class_order[np.argmax(piece_logits)]
-    return class_to_fen[pred_class]
+    return squares
 
 
-def resolve_move_hybrid(
-    changed_squares: list[str],
-    board: chess.Board,
-    squares: list[np.ndarray],
-    occ_model: ONNXClassifier,
-    piece_model: ONNXClassifier,
-    piece_class_order: list[str],
-    input_size: int,
-) -> chess.Move | None:
-    """Resolve a move using changed squares + CNN classification + legal move validation.
+def resolve_move(changed_squares: list[str], board: chess.Board) -> chess.Move | None:
+    """Find the legal move that best matches the changed squares.
 
-    Strategy:
-    1. For each legal move, check if it touches the changed squares
-    2. If multiple moves match, use CNN to classify the destination square
-       to disambiguate
+    Relaxed matching: accepts even a single changed square if only one
+    legal move involves it. Scores candidates by overlap count.
     """
     changed_set = set(changed_squares)
-    candidates = []
+    candidates: list[tuple[chess.Move, int]] = []
 
     for move in board.legal_moves:
-        move_squares = {chess.square_name(move.from_square), chess.square_name(move.to_square)}
-
-        if board.is_castling(move):
-            rank = "1" if board.turn == chess.WHITE else "8"
-            if board.is_kingside_castling(move):
-                move_squares.update({f"h{rank}", f"f{rank}"})
-            else:
-                move_squares.update({f"a{rank}", f"d{rank}"})
-
-        if board.is_en_passant(move):
-            cap_rank = "5" if board.turn == chess.WHITE else "4"
-            cap_file = chess.square_name(move.to_square)[0]
-            move_squares.add(f"{cap_file}{cap_rank}")
-
+        move_squares = get_move_squares(move, board)
         overlap = len(move_squares & changed_set)
 
-        if move_squares == changed_set:
-            candidates.append((move, overlap, True))  # Perfect match
-        elif overlap >= 2:
-            candidates.append((move, overlap, False))
+        if overlap > 0:
+            candidates.append((move, overlap))
 
     if not candidates:
         return None
 
-    # Perfect matches first
-    perfect = [c for c in candidates if c[2]]
-    if len(perfect) == 1:
-        return perfect[0][0]
+    # Sort by overlap (most matching squares first)
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    best_overlap = candidates[0][1]
 
-    # Multiple candidates: use CNN to classify destination square
-    if len(candidates) >= 1:
-        best_move = candidates[0][0]
+    # Get all candidates tied for best overlap
+    best_candidates = [m for m, o in candidates if o == best_overlap]
 
-        if len(candidates) > 1:
-            # Use CNN on the destination square to disambiguate
-            dest_name = chess.square_name(candidates[0][0].to_square)
-            dest_idx = name_to_square_index(dest_name)
-            dest_piece = classify_square(
-                squares[dest_idx], occ_model, piece_model,
-                piece_class_order, input_size,
-            )
+    if len(best_candidates) == 1:
+        return best_candidates[0]
 
-            # Find the candidate whose result matches CNN prediction
-            for move, overlap, perfect in candidates:
-                board.push(move)
-                expected_piece = board.piece_at(move.to_square)
-                board.pop()
-                if expected_piece and expected_piece.symbol() == dest_piece:
-                    return move
+    # Multiple candidates with same overlap. Try to disambiguate:
+    # Prefer moves where the changed squares are exactly the move squares
+    for move in best_candidates:
+        if get_move_squares(move, board) == changed_set:
+            return move
 
-        return best_move
+    # Prefer moves with higher overlap ratio (changed covers more of the move)
+    best_ratio = 0
+    best_move = best_candidates[0]
+    for move in best_candidates:
+        ms = get_move_squares(move, board)
+        ratio = len(ms & changed_set) / len(ms)
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_move = move
 
-    return None
+    return best_move
 
 
 def draw_debug(warped, board, changed_squares, detector, last_move_san):
@@ -202,33 +163,10 @@ def main():
     parser.add_argument("--interval", type=float, default=0.3)
     parser.add_argument("--white", type=str, default="White")
     parser.add_argument("--black", type=str, default="Black")
-    parser.add_argument("--threshold", type=float, default=15.0)
+    parser.add_argument("--threshold", type=float, default=12.0)
     parser.add_argument("--stability", type=int, default=4)
     parser.add_argument("--no-display", action="store_true")
     args = parser.parse_args()
-
-    # Load models (for disambiguation only)
-    project_root = Path(__file__).resolve().parent.parent
-    occ_path = project_root / "models/occupancy.onnx"
-    piece_path = project_root / "models/piece.onnx"
-
-    occ_model = None
-    piece_model = None
-    piece_class_order = []
-    input_size = 100
-
-    if occ_path.exists() and piece_path.exists():
-        print("Loading CNN models (for disambiguation)...")
-        occ_model = ONNXClassifier(occ_path)
-        piece_model = ONNXClassifier(piece_path)
-        occ_shape = occ_model.session.get_inputs()[0].shape
-        input_size = occ_shape[2] if isinstance(occ_shape[2], int) else 100
-
-        classes_file = project_root / "models/piece_classes.json"
-        if classes_file.exists():
-            piece_class_order = json.load(open(classes_file))
-    else:
-        print("No CNN models found. Using pixel-only mode (less accurate for ambiguous moves).")
 
     # Open camera
     cap = cv2.VideoCapture(args.camera)
@@ -249,23 +187,19 @@ def main():
     H = compute_homography(corners)
     warped = warp_board(frame, H)
 
-    # STARTING POSITION IS KNOWN
     board = chess.Board()
-    move_history: list[chess.Move] = []
-
-    # Pixel detector for change detection
     detector = PixelMoveDetector(
         stability_frames=args.stability,
         change_threshold=args.threshold,
     )
     detector.set_reference(warped)
-
+    move_history: list[chess.Move] = []
     last_move_san = ""
 
     print()
     print("=== RECORDING ===")
-    print("Starting position assumed. Make moves and they'll be detected.")
     print(f"Output: {args.output}")
+    print(f"Threshold: {args.threshold}, Stability: {args.stability} frames")
     print("Press Q in window or Ctrl+C to stop.")
     print()
     print(board)
@@ -279,7 +213,6 @@ def main():
                 continue
 
             warped = warp_board(frame, H)
-            squares = extract_squares(warped)
             changed = detector.detect_change(warped)
 
             if not args.no_display:
@@ -292,22 +225,7 @@ def main():
             if changed is None:
                 continue
 
-            # Resolve the move
-            if occ_model and piece_model:
-                move = resolve_move_hybrid(
-                    changed, board, squares,
-                    occ_model, piece_model, piece_class_order, input_size,
-                )
-            else:
-                # Pixel-only fallback
-                changed_set = set(changed)
-                move = None
-                for m in board.legal_moves:
-                    ms = {chess.square_name(m.from_square), chess.square_name(m.to_square)}
-                    if ms == changed_set or (len(ms & changed_set) >= 2):
-                        move = m
-                        break
-
+            move = resolve_move(changed, board)
             if move is None:
                 print(f"  ? Changed: {changed}, no legal move matched. Resetting.")
                 detector.set_reference(warped)
