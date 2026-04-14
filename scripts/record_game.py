@@ -240,9 +240,9 @@ def main():
             # Periodically re-detect corners (handles board shifting mid-game)
             if xcorner_det and frame_count > 0 and frame_count % RECALIBRATE_INTERVAL == 0:
                 try:
-                    new_corners = auto_detect_corners(
-                        detector.detect_raw(frame), xcorner_det, frame
-                    )
+                    # Use full frame (no crop) so piece colors are detected for orientation
+                    full_dets = detector.detect_raw(frame)
+                    new_corners = auto_detect_corners(full_dets, xcorner_det, frame)
                     if new_corners is not None:
                         shift = np.max(np.abs(new_corners - corners))
                         if shift > 15:
@@ -250,8 +250,11 @@ def main():
                             square_centers = compute_square_centers(corners, frame.shape)
                             crop_region = compute_crop_region(corners)
                             board_quad = compute_board_quad(corners)
+                            # Reset EMA so it re-learns with new orientation
+                            detector.state = np.zeros((64, 12), dtype=np.float32)
+                            detector.initialized = False
                 except Exception:
-                    pass  # Recalibration failed, keep current corners
+                    pass
 
             dets = detector.detect_raw(frame, crop_region=crop_region)
             update = detector.detections_to_board(dets, square_centers, board_quad)
