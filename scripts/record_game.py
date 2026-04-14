@@ -152,7 +152,8 @@ def main():
 
     frames_since_last_move = 0
     frame_count = 0
-    UNDO_CHECK_FRAMES = 15  # ~0.75s at 20 FPS
+    greedy_pending = False
+    UNDO_CHECK_FRAMES = 10  # ~0.5s at 20 FPS, check if greedy move was correct
 
     try:
         while not board.is_game_over():
@@ -192,20 +193,24 @@ def main():
             if hand_on_board:
                 continue
 
-            # Undo check: if last move still looks wrong after a few frames, take it back
-            if (move_history and frames_since_last_move == UNDO_CHECK_FRAMES):
+            # Auto-undo: if last move was greedy and looks wrong, retract it
+            if (greedy_pending and frames_since_last_move >= UNDO_CHECK_FRAMES):
                 last_move = move_history[-1]
                 from_sq = last_move.from_square
                 to_sq = last_move.to_square
-                # If the from-square still looks occupied, the move was probably wrong
                 from_occ = float(np.max(detector.state[from_sq]))
                 to_occ = float(np.max(detector.state[to_sq]))
-                if from_occ > 0.5 and to_occ < 0.3:
+                # If from-square still looks occupied OR to-square looks empty, undo
+                if from_occ > 0.4 or to_occ < 0.2:
                     board.pop()
                     undone = move_history.pop()
                     last_move_san = move_history[-1].uci() if move_history else ""
-                    print(f"  (undid {chess.square_name(undone.from_square)}{chess.square_name(undone.to_square)}, looked wrong)")
+                    greedy_pending = False
+                    print(f"  (undid {chess.square_name(undone.from_square)}{chess.square_name(undone.to_square)})")
                     continue
+                else:
+                    # Move confirmed, no longer pending
+                    greedy_pending = False
 
             san = move_detector.detect_move(board, detector.state)
             if san is None:
@@ -216,6 +221,7 @@ def main():
             move_history.append(move)
             last_move_san = san
             frames_since_last_move = 0
+            greedy_pending = True  # All moves start as tentative
 
             if board.turn == chess.WHITE:
                 print(f"  {board.fullmove_number - 1}... {san}")
