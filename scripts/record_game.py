@@ -266,9 +266,19 @@ def main():
             game_file = games_dir / f"{timestamp}_{args.white}_vs_{args.black}.pgn"
             save_pgn(pgn, game_file)
 
+            # Copy PGN to clipboard
+            import subprocess
+            try:
+                subprocess.run(["pbcopy"], input=pgn.encode(), check=True)
+                clipboard_ok = True
+            except (FileNotFoundError, subprocess.CalledProcessError):
+                clipboard_ok = False
+
             print(f"\nGame saved to:")
             print(f"  {args.output}")
             print(f"  {game_file}")
+            if clipboard_ok:
+                print(f"  (copied to clipboard)")
             print(f"Moves: {len(move_history)} | Result: {result}")
             print(f"\nFinal position:")
             print(board)
