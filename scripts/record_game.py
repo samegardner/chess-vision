@@ -1,8 +1,5 @@
 """Record a chess game using ChessCam's YOLO model + move scoring.
 
-Uses pretrained LeYOLO for piece detection, EMA smoothing, and
-ChessCam-style two-move lookahead with greedy fallback.
-
 Usage:
     python scripts/record_game.py
     python scripts/record_game.py --select-corners
@@ -23,7 +20,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from chess_vision.board.detect import select_corners
 from chess_vision.board.warp import order_corners
 from chess_vision.inference.yolo_detect import (
-    YoloPieceDetector, compute_square_centers, compute_crop_region, YOLO_CLASSES,
+    YoloPieceDetector, compute_square_centers, compute_crop_region,
+    compute_board_quad,
 )
 from chess_vision.game.move_scorer import MoveDetectorV2
 from chess_vision.game.pgn import generate_pgn, save_pgn
@@ -79,8 +77,7 @@ def main():
     parser.add_argument("--white", type=str, default="White")
     parser.add_argument("--black", type=str, default="Black")
     parser.add_argument("--ema", type=float, default=0.5)
-    parser.add_argument("--greedy-delay", type=float, default=3.0,
-                        help="Seconds a move must be top candidate before greedy accept")
+    parser.add_argument("--greedy-delay", type=float, default=1.0)
     parser.add_argument("--no-display", action="store_true")
     args = parser.parse_args()
 
@@ -108,38 +105,31 @@ def main():
     corners = load_or_select_corners(frame, force_select=args.select_corners)
     square_centers = compute_square_centers(corners, frame.shape)
     crop_region = compute_crop_region(corners)
-    print(f"Board crop region: {crop_region}")
+    board_quad = compute_board_quad(corners)
 
-    # Test detection with cropping
-    dets_full = detector.detect_raw(frame)
-    dets_crop = detector.detect_raw(frame, crop_region=crop_region)
-    print(f"Detections without crop: {len(dets_full)}, with crop: {len(dets_crop)}")
+    # Quick detection test
+    dets = detector.detect_raw(frame, crop_region=crop_region)
+    print(f"Initial detection: {len(dets)} pieces")
 
-    # Warmup: let EMA stabilize
-    WARMUP_FRAMES = 15
+    # Warmup: build EMA state (no move detection yet)
+    WARMUP_FRAMES = 10
     print(f"Stabilizing ({WARMUP_FRAMES * args.interval:.0f}s)...")
-    for i in range(WARMUP_FRAMES):
+    for _ in range(WARMUP_FRAMES):
         time.sleep(args.interval)
         ret, frame = cap.read()
         if ret:
             dets = detector.detect_raw(frame, crop_region=crop_region)
-            update = detector.detections_to_board(dets, square_centers)
+            update = detector.detections_to_board(dets, square_centers, board_quad)
             detector.update_state(update)
-            if not args.no_display:
-                debug = draw_debug(frame, dets, square_centers, chess.Board(), "", corners)
-                cv2.imshow("Chess Vision", debug)
-                cv2.waitKey(1)
 
-    # Snapshot the starting state so we can detect changes FROM it
-    starting_state = detector.state.copy()
-    print(f"Ready! (EMA stabilized, {np.sum(np.max(starting_state, axis=1) > 0.3)} squares occupied)")
+    # Count how many squares look occupied after warmup
+    occupied = int(np.sum(np.max(detector.state, axis=1) > 0.3))
+    print(f"Ready! ({occupied} squares look occupied)")
 
     board = chess.Board()
     move_history: list[chess.Move] = []
     last_move_san = ""
-    # Create detector AFTER warmup so greedy timers start fresh
-    # Pass baseline state so it can reject persistent detection biases
-    move_detector = MoveDetectorV2(greedy_delay=args.greedy_delay, baseline_state=starting_state)
+    move_detector = MoveDetectorV2(greedy_delay=args.greedy_delay)
 
     print()
     print("=== RECORDING ===")
@@ -157,7 +147,7 @@ def main():
                 continue
 
             dets = detector.detect_raw(frame, crop_region=crop_region)
-            update = detector.detections_to_board(dets, square_centers)
+            update = detector.detections_to_board(dets, square_centers, board_quad)
             detector.update_state(update)
 
             if not args.no_display:
@@ -167,7 +157,6 @@ def main():
                 if key == ord("q"):
                     break
 
-            # Check for moves using ChessCam-style scoring
             san = move_detector.detect_move(board, detector.state)
             if san is None:
                 continue

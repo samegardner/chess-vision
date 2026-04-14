@@ -5,7 +5,7 @@ Uses two-move lookahead and greedy fallback with time-based confirmation.
 """
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import chess
 import numpy as np
@@ -17,11 +17,10 @@ LABEL_MAP = {label: i for i, label in enumerate(LABELS)}
 
 @dataclass
 class MoveData:
-    """Describes what a move expects on the board."""
     san: str
-    from_squares: list[int]  # Squares that should become empty
-    to_squares: list[int]    # Squares that should have specific pieces
-    targets: list[int]       # Class index expected on each to_square
+    from_squares: list[int]
+    to_squares: list[int]
+    targets: list[int]
 
 
 @dataclass
@@ -32,18 +31,14 @@ class MovePair:
 
 
 def piece_to_label_idx(piece: chess.Piece) -> int:
-    """Convert a python-chess Piece to a LABELS index."""
-    sym = piece.symbol()
-    return LABEL_MAP[sym]
+    return LABEL_MAP[piece.symbol()]
 
 
 def get_move_data(board: chess.Board, move: chess.Move) -> MoveData:
-    """Extract from/to/target data for a move."""
     san = board.san(move)
     from_squares = [move.from_square]
     to_squares = [move.to_square]
 
-    # What piece ends up on the to_square
     piece = board.piece_at(move.from_square)
     if move.promotion:
         promoted = chess.Piece(move.promotion, piece.color)
@@ -51,7 +46,6 @@ def get_move_data(board: chess.Board, move: chess.Move) -> MoveData:
     else:
         targets = [piece_to_label_idx(piece)]
 
-    # Castling: rook also moves
     if board.is_castling(move):
         rank = 0 if board.turn == chess.WHITE else 7
         if board.is_kingside_castling(move):
@@ -63,24 +57,17 @@ def get_move_data(board: chess.Board, move: chess.Move) -> MoveData:
         rook = chess.Piece(chess.ROOK, board.turn)
         targets.append(piece_to_label_idx(rook))
 
-    # En passant: captured pawn disappears
     if board.is_en_passant(move):
         cap_sq = chess.square(chess.square_file(move.to_square), chess.square_rank(move.from_square))
         from_squares.append(cap_sq)
-
-    # Capture: the to_square was occupied, now has the moving piece (already handled)
 
     return MoveData(san=san, from_squares=from_squares, to_squares=to_squares, targets=targets)
 
 
 def combine_data(move1: MoveData, move2: MoveData) -> MoveData:
-    """Combine two moves into a single scoring unit (ChessCam's combineData)."""
     bad_squares = set(move2.from_squares + move2.to_squares)
-
-    # Keep move1's squares that don't overlap with move2
     from1 = [sq for sq in move1.from_squares if sq not in bad_squares]
-    to1 = []
-    targets1 = []
+    to1, targets1 = [], []
     for i, sq in enumerate(move1.to_squares):
         if sq not in bad_squares:
             to1.append(sq)
@@ -95,11 +82,9 @@ def combine_data(move1: MoveData, move2: MoveData) -> MoveData:
 
 
 def get_move_pairs(board: chess.Board) -> list[MovePair]:
-    """Enumerate all legal move pairs (move + opponent's response)."""
     pairs = []
     for move1 in board.legal_moves:
         move1_data = get_move_data(board, move1)
-
         board.push(move1)
         has_response = False
         for move2 in board.legal_moves:
@@ -108,18 +93,17 @@ def get_move_pairs(board: chess.Board) -> list[MovePair]:
             pairs.append(MovePair(move1=move1_data, move2=move2_data, combined=combined))
             has_response = True
         board.pop()
-
         if not has_response:
             pairs.append(MovePair(move1=move1_data, move2=None, combined=None))
-
     return pairs
 
 
 def calculate_score(state: np.ndarray, move: MoveData, threshold: float = 0.6) -> float:
-    """Score how well the state matrix matches a move (ChessCam's calculateScore).
+    """Score how well the state matrix matches a move.
 
-    For 'from' squares: reward emptiness (1 - max_confidence - threshold)
-    For 'to' squares: reward correct piece detection (confidence - threshold)
+    Exactly matches ChessCam's calculateScore:
+    - from squares: reward emptiness (1 - max_confidence - threshold)
+    - to squares: reward correct piece (confidence - threshold)
     """
     score = 0.0
     for sq in move.from_squares:
@@ -132,34 +116,13 @@ def calculate_score(state: np.ndarray, move: MoveData, threshold: float = 0.6) -
 class MoveDetectorV2:
     """ChessCam-style move detection with two-move lookahead and greedy fallback."""
 
-    def __init__(self, greedy_delay: float = 3.0, baseline_state: np.ndarray | None = None):
+    def __init__(self, greedy_delay: float = 1.0):
         self.possible_moves: set[str] = set()
         self.greedy_times: dict[str, float] = {}
         self.greedy_delay = greedy_delay
         self.last_move_san: str = ""
-        self.baseline_state = baseline_state  # EMA state from warmup (starting position)
-
-    def _state_changed_enough(self, state: np.ndarray, move: MoveData) -> bool:
-        """Check that the from/to squares actually changed from the baseline.
-
-        Rejects moves where the model had the same bias during warmup
-        (e.g., consistently thinks h2 is empty even in starting position).
-        """
-        if self.baseline_state is None:
-            return True
-
-        min_change = 0.15  # Minimum EMA change from baseline to count
-        for sq in move.from_squares:
-            delta = float(np.max(self.baseline_state[sq])) - float(np.max(state[sq]))
-            if delta < min_change:
-                return False  # This square didn't change from baseline
-        return True
 
     def detect_move(self, board: chess.Board, state: np.ndarray) -> str | None:
-        """Check if a move should be played based on the current state matrix.
-
-        Returns SAN string of the detected move, or None.
-        """
         pairs = get_move_pairs(board)
 
         best_score1 = float("-inf")
@@ -170,12 +133,8 @@ class MoveDetectorV2:
         seen: set[str] = set()
 
         for pair in pairs:
-            # Score move1 (deduplicated)
             if pair.move1.san not in seen:
                 seen.add(pair.move1.san)
-                # Skip moves where from-squares haven't changed from baseline
-                if not self._state_changed_enough(state, pair.move1):
-                    continue
                 score1 = calculate_score(state, pair.move1)
                 if score1 > 0:
                     self.possible_moves.add(pair.move1.san)
@@ -183,7 +142,6 @@ class MoveDetectorV2:
                     best_score1 = score1
                     best_move = pair.move1
 
-            # Score move pair (only if move1 is "possible" and move2 exists)
             if pair.move2 is None or pair.combined is None:
                 continue
             if pair.move1.san not in self.possible_moves:
@@ -226,7 +184,7 @@ class MoveDetectorV2:
                 self.last_move_san = san
                 return san
 
-        # Clean up greedy times for moves that are no longer the best
+        # Clean up stale greedy times
         if best_move is not None:
             self.greedy_times = {
                 san: t for san, t in self.greedy_times.items()

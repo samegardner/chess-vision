@@ -1,8 +1,8 @@
 """YOLO-based piece detection using ChessCam's pretrained model.
 
-Detects chess pieces with bounding boxes, maps them to board squares
-using the perspective transform, and maintains a smoothed state matrix
-via exponential moving average.
+Matches ChessCam's preprocessing exactly: letterbox resize with gray
+padding (114), no NMS (let square-level max aggregate), bottom-width/3
+anchor point for piece-to-square mapping, out-of-board filtering.
 """
 
 import cv2
@@ -12,14 +12,43 @@ import onnxruntime as ort
 # ChessCam class ordering (lowercase = black, uppercase = white)
 YOLO_CLASSES = ["b", "k", "n", "p", "q", "r", "B", "K", "N", "P", "Q", "R"]
 
-# Map to standard FEN chars
-YOLO_TO_FEN = {
-    "b": "b", "k": "k", "n": "n", "p": "p", "q": "q", "r": "r",
-    "B": "B", "K": "K", "N": "N", "P": "P", "Q": "Q", "R": "R",
-}
-
 MODEL_WIDTH = 480
 MODEL_HEIGHT = 288
+
+
+def letterbox_resize(image: np.ndarray, target_w: int, target_h: int, pad_value: int = 114):
+    """Resize preserving aspect ratio, pad with gray (matching ChessCam's detect.tsx).
+
+    Returns (resized_image, scale, pad_x, pad_y) where scale/pad are needed
+    to map coordinates back to original space.
+    """
+    h, w = image.shape[:2]
+    scale = min(target_w / w, target_h / h)
+    new_w = int(w * scale)
+    new_h = int(h * scale)
+
+    resized = cv2.resize(image, (new_w, new_h))
+
+    # Pad to target size
+    pad_x = (target_w - new_w) // 2
+    pad_y = (target_h - new_h) // 2
+    padded = np.full((target_h, target_w, 3), pad_value, dtype=np.uint8)
+    padded[pad_y:pad_y + new_h, pad_x:pad_x + new_w] = resized
+
+    return padded, scale, pad_x, pad_y
+
+
+def point_in_quad(point: np.ndarray, quad: np.ndarray) -> bool:
+    """Check if a point is inside a quadrilateral using cross-product test."""
+    px, py = point
+    n = len(quad)
+    for i in range(n):
+        x1, y1 = quad[i]
+        x2, y2 = quad[(i + 1) % n]
+        cross = (x2 - x1) * (py - y1) - (y2 - y1) * (px - x1)
+        if cross < 0:
+            return False
+    return True
 
 
 class YoloPieceDetector:
@@ -37,15 +66,9 @@ class YoloPieceDetector:
     def detect_raw(self, image: np.ndarray, crop_region: tuple | None = None) -> list[dict]:
         """Run YOLO on an image, return raw detections.
 
-        Args:
-            image: Full camera frame (BGR).
-            crop_region: Optional (x1, y1, x2, y2) to crop before detection.
-                         Coordinates returned are mapped back to full image space.
-
-        Returns list of dicts with keys: cx, cy, w, h, class_id, class_name, confidence
-        All coordinates are in original image pixel space.
+        All coordinates returned in original image pixel space.
+        No NMS applied (matching ChessCam's approach).
         """
-        # Crop to board region if provided (makes pieces larger in the input)
         offset_x, offset_y = 0, 0
         if crop_region is not None:
             x1, y1, x2, y2 = crop_region
@@ -56,63 +79,45 @@ class YoloPieceDetector:
 
         h_orig, w_orig = image.shape[:2]
 
-        # Preprocess: resize to model input, normalize to 0-1, CHW format
-        resized = cv2.resize(image, (MODEL_WIDTH, MODEL_HEIGHT))
-        blob = resized.astype(np.float16) / 255.0
+        # Letterbox resize (matching ChessCam's preprocessing)
+        padded, scale, pad_x, pad_y = letterbox_resize(image, MODEL_WIDTH, MODEL_HEIGHT)
+        blob = padded.astype(np.float32) / 255.0  # float32, not float16
         blob = blob.transpose(2, 0, 1)[np.newaxis, ...]  # (1, 3, 288, 480)
+        # Model expects float16 input
+        blob = blob.astype(np.float16)
 
         # Run inference
         outputs = self.session.run(None, {"images": blob})[0]  # (1, 16, N)
         preds = outputs[0].astype(np.float32)  # (16, N)
 
-        boxes = []
-        scores = []
-        class_ids = []
-        scale_x = w_orig / MODEL_WIDTH
-        scale_y = h_orig / MODEL_HEIGHT
-
+        detections = []
         for i in range(preds.shape[1]):
             cx, cy, w, bh = preds[0, i], preds[1, i], preds[2, i], preds[3, i]
-            class_scores = preds[4:, i]
-            class_id = int(np.argmax(class_scores))
-            confidence = float(class_scores[class_id])
+            all_scores = preds[4:, i]  # 12 class scores
+            max_score = float(np.max(all_scores))
 
-            if confidence < self.conf_threshold:
+            if max_score < self.conf_threshold:
                 continue
 
-            boxes.append([
-                float(cx * scale_x), float(cy * scale_y),
-                float(w * scale_x), float(bh * scale_y),
-            ])
-            scores.append(confidence)
-            class_ids.append(class_id)
+            # Undo letterbox: remove padding, then unscale
+            real_cx = (float(cx) - pad_x) / scale
+            real_cy = (float(cy) - pad_y) / scale
+            real_w = float(w) / scale
+            real_h = float(bh) / scale
 
-        if not boxes:
-            return []
+            # Add crop offset
+            real_cx += offset_x
+            real_cy += offset_y
 
-        # Non-Maximum Suppression
-        boxes_arr = np.array(boxes)
-        # Convert cx,cy,w,h to x1,y1,x2,y2 for NMS
-        x1 = boxes_arr[:, 0] - boxes_arr[:, 2] / 2
-        y1 = boxes_arr[:, 1] - boxes_arr[:, 3] / 2
-        x2 = boxes_arr[:, 0] + boxes_arr[:, 2] / 2
-        y2 = boxes_arr[:, 1] + boxes_arr[:, 3] / 2
-        nms_boxes = np.stack([x1, y1, x2, y2], axis=1).tolist()
-
-        indices = cv2.dnn.NMSBoxes(nms_boxes, scores, self.conf_threshold, 0.5)
-        if len(indices) == 0:
-            return []
-
-        detections = []
-        for idx in indices.flatten():
             detections.append({
-                "cx": boxes[idx][0] + offset_x,
-                "cy": boxes[idx][1] + offset_y,
-                "w": boxes[idx][2],
-                "h": boxes[idx][3],
-                "class_id": class_ids[idx],
-                "class_name": YOLO_CLASSES[class_ids[idx]],
-                "confidence": scores[idx],
+                "cx": real_cx,
+                "cy": real_cy,
+                "w": real_w,
+                "h": real_h,
+                "scores": all_scores.tolist(),  # All 12 class scores (not just argmax)
+                "class_id": int(np.argmax(all_scores)),
+                "class_name": YOLO_CLASSES[int(np.argmax(all_scores))],
+                "confidence": max_score,
             })
 
         return detections
@@ -121,24 +126,25 @@ class YoloPieceDetector:
         self,
         detections: list[dict],
         square_centers: np.ndarray,
+        board_quad: np.ndarray | None = None,
     ) -> np.ndarray:
         """Map detections to a 64x12 update matrix.
 
-        Args:
-            detections: Raw YOLO detections with cx, cy coordinates.
-            square_centers: (64, 2) array of square center coordinates in image space.
-
-        Returns:
-            (64, 12) matrix where each cell is the max confidence of that
-            class being detected on that square.
+        Uses ALL class scores per detection (not just argmax).
+        Filters out detections outside the board boundary.
+        Uses ChessCam's anchor: bottom of box minus width/3.
         """
         update = np.zeros((64, 12), dtype=np.float32)
 
         for det in detections:
-            # Use bottom-center of box as the piece position
-            # (pieces are taller than their base, so center is above the square)
+            # ChessCam anchor: (center_x, bottom - width/3)
             piece_x = det["cx"]
-            piece_y = det["cy"] + det["h"] * 0.15  # Shift down slightly
+            piece_y = det["cy"] + det["h"] / 2 - det["w"] / 3
+
+            # Filter out-of-board detections
+            if board_quad is not None:
+                if not point_in_quad(np.array([piece_x, piece_y]), board_quad):
+                    continue
 
             # Find nearest square
             dists = np.sqrt(
@@ -147,10 +153,12 @@ class YoloPieceDetector:
             )
             nearest_sq = int(np.argmin(dists))
 
-            # Update with max confidence for this class on this square
-            update[nearest_sq, det["class_id"]] = max(
-                update[nearest_sq, det["class_id"]], det["confidence"]
-            )
+            # Update with ALL class scores (max per class per square)
+            scores = det["scores"]
+            for cls_idx in range(12):
+                update[nearest_sq, cls_idx] = max(
+                    update[nearest_sq, cls_idx], scores[cls_idx]
+                )
 
         return update
 
@@ -162,29 +170,9 @@ class YoloPieceDetector:
         else:
             self.state = self.ema_decay * self.state + (1 - self.ema_decay) * update
 
-    def get_board_state(self) -> dict[str, str | None]:
-        """Read the current smoothed state as a board state dict."""
-        board_state = {}
-        for i in range(64):
-            file = chr(ord("a") + i % 8)
-            rank = str(i // 8 + 1)
-            sq_name = file + rank
-
-            max_score = float(np.max(self.state[i]))
-            if max_score > 0.3:  # Occupied threshold
-                class_id = int(np.argmax(self.state[i]))
-                board_state[sq_name] = YOLO_TO_FEN[YOLO_CLASSES[class_id]]
-            else:
-                board_state[sq_name] = None
-
-        return board_state
-
 
 def compute_crop_region(corners: np.ndarray, padding: float = 0.15) -> tuple[int, int, int, int]:
-    """Compute a bounding box around the board corners with padding.
-
-    Returns (x1, y1, x2, y2) crop region.
-    """
+    """Compute a bounding box around the board corners with padding."""
     from chess_vision.board.warp import order_corners
     ordered = order_corners(corners)
     xs = ordered[:, 0]
@@ -193,24 +181,23 @@ def compute_crop_region(corners: np.ndarray, padding: float = 0.15) -> tuple[int
     y1, y2 = float(ys.min()), float(ys.max())
     w = x2 - x1
     h = y2 - y1
-    # Add padding (pieces extend above the board edge)
     x1 -= w * padding
-    y1 -= h * padding * 2  # More padding on top (pieces are tall)
+    y1 -= h * padding * 2  # More padding on top for tall pieces
     x2 += w * padding
     y2 += h * padding
     return (int(x1), int(y1), int(x2), int(y2))
 
 
+def compute_board_quad(corners: np.ndarray) -> np.ndarray:
+    """Get the ordered board quadrilateral for point-in-quad filtering."""
+    from chess_vision.board.warp import order_corners
+    return order_corners(corners)
+
+
 def compute_square_centers(corners: np.ndarray, image_shape: tuple) -> np.ndarray:
     """Compute the 64 square center positions in image space.
 
-    Args:
-        corners: (4, 2) board corners (TL, TR, BR, BL after ordering).
-        image_shape: (height, width, ...) of the image.
-
-    Returns:
-        (64, 2) array of (x, y) center coordinates for each square.
-        Indexed 0=a1, 1=b1, ..., 63=h8.
+    Indexed 0=a1, 1=b1, ..., 63=h8.
     """
     from chess_vision.board.warp import order_corners
 
@@ -220,13 +207,9 @@ def compute_square_centers(corners: np.ndarray, image_shape: tuple) -> np.ndarra
     centers = np.zeros((64, 2), dtype=np.float32)
     for rank in range(8):
         for file in range(8):
-            # Bilinear interpolation across the quadrilateral
-            # rank 0 = rank 1 (bottom), rank 7 = rank 8 (top)
-            # In the image: rank 1 is at the bottom (BL-BR edge)
-            u = (file + 0.5) / 8  # Horizontal fraction
-            v = (rank + 0.5) / 8  # Vertical fraction (0=bottom, 1=top)
+            u = (file + 0.5) / 8
+            v = (rank + 0.5) / 8  # 0=bottom, 1=top
 
-            # Interpolate: bottom edge = BL to BR, top edge = TL to TR
             bottom = bl + u * (br - bl)
             top = tl + u * (tr - tl)
             center = bottom + v * (top - bottom)
