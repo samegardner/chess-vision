@@ -179,15 +179,43 @@ def auto_detect_corners(
     if best_rotation is None:
         return None
 
-    # Step 5: Disambiguate a-file vs h-file using Queen position
+    # Step 5: Disambiguate a-file vs h-file using Queen/King positions
+    # The Queen is on d1 (a-file half) and King on e1 (h-file half).
+    # Project Queen and King positions onto the rank-1 edge vector.
+    # Queen should project closer to the a1 end, King to h1 end.
     a1, a8, h8, h1 = best_rotation
-    white_queens = [d for d in piece_detections if d["class_name"] == "Q" and d["confidence"] > 0.3]
+    a1_pos = np.array(a1)
+    h1_pos = np.array(h1)
+    edge_vec = h1_pos - a1_pos  # Vector from a1 to h1
+    edge_len = np.linalg.norm(edge_vec)
 
-    if white_queens:
-        queen_pos = np.array([white_queens[0]["cx"], white_queens[0]["cy"]])
-        a1_pos = np.array(a1)
-        h1_pos = np.array(h1)
-        if np.linalg.norm(queen_pos - h1_pos) < np.linalg.norm(queen_pos - a1_pos):
-            best_rotation = [h1, h8, a8, a1]
+    if edge_len < 1:
+        return np.array(best_rotation, dtype=np.float32)
+
+    edge_unit = edge_vec / edge_len
+
+    white_queens = [d for d in piece_detections if d["class_name"] == "Q" and d["confidence"] > 0.3]
+    white_kings = [d for d in piece_detections if d["class_name"] == "K" and d["confidence"] > 0.3]
+
+    should_swap = False
+    if white_queens and white_kings:
+        # Project both onto the rank-1 edge. Queen (d-file) should have
+        # a smaller projection than King (e-file) along a1->h1.
+        q_pos = np.array([white_queens[0]["cx"], white_queens[0]["cy"]])
+        k_pos = np.array([white_kings[0]["cx"], white_kings[0]["cy"]])
+        q_proj = np.dot(q_pos - a1_pos, edge_unit)
+        k_proj = np.dot(k_pos - a1_pos, edge_unit)
+        # If Queen projects further along a1->h1 than King, the files are backwards
+        if q_proj > k_proj:
+            should_swap = True
+    elif white_queens:
+        # Queen alone: should be in the a1 half (projection < edge_len/2)
+        q_pos = np.array([white_queens[0]["cx"], white_queens[0]["cy"]])
+        q_proj = np.dot(q_pos - a1_pos, edge_unit)
+        if q_proj > edge_len / 2:
+            should_swap = True
+
+    if should_swap:
+        best_rotation = [h1, h8, a8, a1]
 
     return np.array(best_rotation, dtype=np.float32)
