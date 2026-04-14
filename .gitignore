@@ -11,14 +11,23 @@ build/
 .venv/
 venv/
 
-# Data and models (large files)
-data/chesscog/
-data/chessred/
-data/processed/
-data/raw/
+# Data (large files)
+data/
+
+# Models (except pretrained chesscam)
 models/occupancy.onnx
 models/piece.onnx
 models/checkpoints/
+models/*.data
+models/piece_classes.json
+
+# Profiles
+profiles/
+
+# Temp images
+*.jpg
+game.pgn
+training.log
 
 # IDE
 .vscode/
