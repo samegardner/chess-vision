@@ -117,9 +117,9 @@ def draw_debug(frame, detections, square_centers, board, move_history, corners,
         else:
             cv2.putText(panel, line, (15, y), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (180, 180, 180), 1)
 
-    # Move count at bottom
-    cv2.putText(panel, f"{len(move_history)} moves recorded", (15, h - 20),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (150, 150, 150), 1)
+    # Controls + move count at bottom
+    cv2.putText(panel, f"{len(move_history)} moves | Q=Quit  R=Reset", (15, h - 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (150, 150, 150), 1)
 
     # Combine frame + panel
     combined = np.hstack([overlay, panel])
@@ -257,7 +257,7 @@ def main():
             # Hand detection: if piece count drops significantly, freeze state
             expected_pieces = len([sq for sq in chess.SQUARES if board.piece_at(sq)])
             detected_pieces = int(np.sum(np.max(update, axis=1) > 0.3))
-            hand_on_board = detected_pieces < expected_pieces * 0.6
+            hand_on_board = detected_pieces < expected_pieces * 0.7
 
             if not hand_on_board:
                 detector.update_state(update)
@@ -274,6 +274,16 @@ def main():
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
                 break
+            elif key == ord("r"):
+                # Reset: clear all moves, restart from beginning
+                board = chess.Board()
+                move_history.clear()
+                last_move_san = ""
+                greedy_pending = False
+                move_detector = MoveDetectorV2(greedy_delay=args.greedy_delay)
+                # Re-snapshot the current board as the new reference
+                detector.state = np.zeros((64, 12), dtype=np.float32)
+                detector.initialized = False
 
             # Don't check for moves while hand is on board
             if hand_on_board:
