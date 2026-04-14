@@ -8,6 +8,7 @@ Usage:
 
 import argparse
 import json
+import subprocess
 import time
 import sys
 from pathlib import Path
@@ -44,8 +45,9 @@ def load_or_select_corners(frame, force_select=False):
     return corners
 
 
-def draw_debug(frame, detections, square_centers, board, move_history, corners,
+def draw_debug(frame, detections, square_centers, board, san_history, corners,
                hand_on_board=False):
+    """Draw debug overlay. san_history is a pre-built list of SAN strings."""
     overlay = frame.copy()
     h, w = overlay.shape[:2]
 
@@ -96,12 +98,9 @@ def draw_debug(frame, detections, square_centers, board, move_history, corners,
     line_height = 35
     max_moves_shown = (h - y_start - 60) // line_height
 
-    # Build move text pairs
+    # Build move text pairs from cached SAN strings
     move_lines = []
-    temp_board = chess.Board()
-    for i, move in enumerate(move_history):
-        san = temp_board.san(move)
-        temp_board.push(move)
+    for i, san in enumerate(san_history):
         if i % 2 == 0:
             move_lines.append(f"{i // 2 + 1}. {san}")
         else:
@@ -118,7 +117,7 @@ def draw_debug(frame, detections, square_centers, board, move_history, corners,
             cv2.putText(panel, line, (15, y), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (180, 180, 180), 1)
 
     # Controls + move count at bottom
-    cv2.putText(panel, f"{len(move_history)} moves | Q=Quit  R=Reset", (15, h - 20),
+    cv2.putText(panel, f"{len(san_history)} moves | Q=Quit  R=Reset", (15, h - 20),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (150, 150, 150), 1)
 
     # Combine frame + panel
@@ -135,8 +134,8 @@ def main():
     parser.add_argument("--interval", type=float, default=0.05)
     parser.add_argument("--white", type=str, default="White")
     parser.add_argument("--black", type=str, default="Black")
-    parser.add_argument("--ema", type=float, default=0.2)
-    parser.add_argument("--greedy-delay", type=float, default=0.4)
+    parser.add_argument("--ema", type=float, default=0.4)
+    parser.add_argument("--greedy-delay", type=float, default=1.0)
     parser.add_argument("--no-display", action="store_true")
     args = parser.parse_args()
 
@@ -144,6 +143,20 @@ def main():
         print(f"Model not found: {MODEL_PATH}")
         return
 
+    # Prevent macOS sleep while recording
+    caffeinate_proc = subprocess.Popen(
+        ["caffeinate", "-dims"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    try:
+        _run_recording(args, caffeinate_proc)
+    finally:
+        caffeinate_proc.terminate()
+
+
+def _run_recording(args, caffeinate_proc):
     print("Loading YOLO piece detector...")
     detector = YoloPieceDetector(str(MODEL_PATH), ema_decay=args.ema)
 
@@ -207,7 +220,7 @@ def main():
 
     board = chess.Board()
     move_history: list[chess.Move] = []
-    last_move_san = ""
+    san_history: list[str] = []  # Cached SAN strings (avoids replaying game each frame)
     move_detector = MoveDetectorV2(greedy_delay=args.greedy_delay)
 
     print()
@@ -222,7 +235,7 @@ def main():
     frame_count = 0
     greedy_pending = False
     UNDO_CHECK_FRAMES = 10
-    RECALIBRATE_INTERVAL = 20  # Re-detect corners every ~1s at 20 FPS
+    RECALIBRATE_INTERVAL = 200  # Re-detect corners every ~10s at 20 FPS
 
     # Load xcorner detector for periodic recalibration
     xcorner_det = None
@@ -273,7 +286,7 @@ def main():
 
             # Draw debug every 3rd frame
             if not args.no_display and frame_count % 3 == 0:
-                debug = draw_debug(frame, dets, square_centers, board, move_history, corners,
+                debug = draw_debug(frame, dets, square_centers, board, san_history, corners,
                                    hand_on_board=hand_on_board)
                 cv2.imshow("Chess Vision", debug)
             key = cv2.waitKey(1) & 0xFF
@@ -283,7 +296,7 @@ def main():
                 # Reset: clear all moves, restart from beginning
                 board = chess.Board()
                 move_history.clear()
-                last_move_san = ""
+                san_history.clear()
                 greedy_pending = False
                 move_detector = MoveDetectorV2(greedy_delay=args.greedy_delay)
                 # Re-snapshot the current board as the new reference
@@ -304,8 +317,8 @@ def main():
                 # If from-square still looks occupied OR to-square looks empty, undo
                 if from_occ > 0.4 or to_occ < 0.2:
                     board.pop()
-                    undone = move_history.pop()
-                    last_move_san = move_history[-1].uci() if move_history else ""
+                    move_history.pop()
+                    san_history.pop()
                     greedy_pending = False
                     # Undo shown in display window via move_history update
                     continue
@@ -320,7 +333,7 @@ def main():
             move = board.parse_san(san)
             board.push(move)
             move_history.append(move)
-            last_move_san = san
+            san_history.append(san)
             frames_since_last_move = 0
             greedy_pending = True  # All moves start as tentative
 
@@ -365,7 +378,6 @@ def main():
             save_pgn(pgn, game_file)
 
             # Copy PGN to clipboard
-            import subprocess
             try:
                 subprocess.run(["pbcopy"], input=pgn.encode(), check=True)
                 clipboard_ok = True
