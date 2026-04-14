@@ -1,9 +1,14 @@
-"""Record a chess game from the camera.
+"""Record a chess game from the camera using pixel-based move detection.
+
+No CNN needed for move tracking. Uses pixel differencing on the warped
+board to detect which squares changed, then python-chess to resolve
+the legal move.
 
 Usage:
     python scripts/record_game.py
-    python scripts/record_game.py --select-corners   # Re-select corners
+    python scripts/record_game.py --select-corners
     python scripts/record_game.py --output mygame.pgn
+    python scripts/record_game.py --threshold 20    # Adjust sensitivity
 """
 
 import argparse
@@ -12,18 +17,14 @@ import time
 import sys
 from pathlib import Path
 
+import chess
 import cv2
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from chess_vision.board.detect import select_corners
 from chess_vision.board.warp import compute_homography, warp_board
-from chess_vision.board.squares import extract_squares, remap_board_state
-from chess_vision.inference.onnx_runtime import ONNXClassifier
-from chess_vision.inference.classify import classify_board, board_to_fen
-from chess_vision.game.state import GameState
-from chess_vision.game.moves import MoveDetector
-from chess_vision.game.rules import resolve_move, detect_orientation
+from chess_vision.game.pixel_moves import PixelMoveDetector
 from chess_vision.game.pgn import generate_pgn, save_pgn
 
 CORNERS_FILE = Path(__file__).parent.parent / "corners.json"
@@ -43,43 +44,80 @@ def load_or_select_corners(frame, force_select=False):
     return corners
 
 
+def resolve_pixel_move(
+    changed_squares: list[str],
+    board: chess.Board,
+) -> chess.Move | None:
+    """Find the legal move that involves the changed squares.
+
+    For each legal move, check if the squares it touches match the
+    observed changed squares. This doesn't need CNN output since we
+    track game state from the known starting position.
+    """
+    changed_set = set(changed_squares)
+
+    best_move = None
+    best_overlap = 0
+
+    for move in board.legal_moves:
+        # Squares this move touches
+        move_squares = {chess.square_name(move.from_square), chess.square_name(move.to_square)}
+
+        # Castling touches rook squares too
+        if board.is_castling(move):
+            if board.is_kingside_castling(move):
+                rook_file = "h"
+                new_rook_file = "f"
+            else:
+                rook_file = "a"
+                new_rook_file = "d"
+            rank = "1" if board.turn == chess.WHITE else "8"
+            move_squares.add(f"{rook_file}{rank}")
+            move_squares.add(f"{new_rook_file}{rank}")
+
+        # En passant removes the captured pawn
+        if board.is_en_passant(move):
+            cap_rank = "5" if board.turn == chess.WHITE else "4"
+            cap_file = chess.square_name(move.to_square)[0]
+            move_squares.add(f"{cap_file}{cap_rank}")
+
+        # Check overlap between expected and observed changes
+        overlap = len(move_squares & changed_set)
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_move = move
+
+        # Perfect match
+        if move_squares == changed_set:
+            return move
+
+    # If we found a good partial match (at least from+to squares matched)
+    if best_move and best_overlap >= 2:
+        return best_move
+
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser(description="Record a chess game")
     parser.add_argument("--camera", type=int, default=0)
     parser.add_argument("--output", type=str, default="game.pgn")
     parser.add_argument("--select-corners", action="store_true", help="Re-select board corners")
-    parser.add_argument("--interval", type=float, default=0.5, help="Seconds between captures")
+    parser.add_argument("--interval", type=float, default=0.3, help="Seconds between captures")
     parser.add_argument("--white", type=str, default="White")
     parser.add_argument("--black", type=str, default="Black")
-    parser.add_argument("--profile", type=str, default=None, help="Use calibrated models from profile")
+    parser.add_argument("--threshold", type=float, default=20.0, help="Pixel change threshold per square")
+    parser.add_argument("--stability", type=int, default=4, help="Stable frames before accepting move")
     args = parser.parse_args()
 
-    # Load models
-    project_root = Path(__file__).resolve().parent.parent
-    if args.profile:
-        occ_path = project_root / f"profiles/{args.profile}/occupancy.onnx"
-        piece_path = project_root / f"profiles/{args.profile}/piece.onnx"
-    else:
-        occ_path = project_root / "models/occupancy.onnx"
-        piece_path = project_root / "models/piece.onnx"
-
-    if not occ_path.exists() or not piece_path.exists():
-        print(f"Model files not found: {occ_path}, {piece_path}")
-        print("Run 'chess-vision train --stage base --fast' first.")
-        return
-
-    print("Loading models...")
-    occ = ONNXClassifier(occ_path)
-    piece = ONNXClassifier(piece_path)
-
-    # Open camera with warmup for auto-exposure
+    # Open camera with warmup
     cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
         print(f"Could not open camera {args.camera}")
         return
 
-    print("Warming up camera (auto-exposure)...")
-    for _ in range(30):  # Read ~30 frames to let auto-exposure settle
+    print("Warming up camera...")
+    for _ in range(30):
         cap.read()
     ret, frame = cap.read()
     if not ret:
@@ -91,79 +129,70 @@ def main():
     corners = load_or_select_corners(frame, force_select=args.select_corners)
     H = compute_homography(corners)
 
-    # Initial board state
+    # Get initial warped board
     warped = warp_board(frame, H)
-    squares = extract_squares(warped)
-    board_state = classify_board(squares, occ, piece)
 
-    flipped = False
-    try:
-        orientation = detect_orientation(board_state)
-        print(f"Orientation: {orientation}")
-        if orientation == "white_top":
-            flipped = True
-            board_state = remap_board_state(board_state)
-            print("Board is flipped, remapping squares.")
-    except ValueError:
-        print("Could not detect orientation, assuming white on bottom.")
+    # Set up game and pixel detector
+    board = chess.Board()
+    detector = PixelMoveDetector(
+        stability_frames=args.stability,
+        change_threshold=args.threshold,
+    )
+    detector.set_reference(warped)
+    move_history: list[chess.Move] = []
 
-    fen = board_to_fen(board_state)
-    print(f"Detected FEN: {fen}")
     print()
-
-    # Game loop
-    game = GameState()
-    detector = MoveDetector()
-    detector.set_initial_board(board_state)
-
     print("=== RECORDING ===")
     print(f"Output: {args.output}")
+    print(f"Sensitivity: threshold={args.threshold}, stability={args.stability} frames")
     print("Make moves on the board. Press Ctrl+C to stop and save.")
     print()
 
     try:
-        while not game.is_game_over():
+        while not board.is_game_over():
             time.sleep(args.interval)
             ret, frame = cap.read()
             if not ret:
                 continue
 
             warped = warp_board(frame, H)
-            squares = extract_squares(warped)
-            board_state = classify_board(squares, occ, piece)
-            if flipped:
-                board_state = remap_board_state(board_state)
+            changed = detector.detect_change(warped)
 
-            changed = detector.detect_change(board_state)
             if changed is None:
                 continue
 
-            move = resolve_move(changed, game.board, board_state)
+            # Try to resolve the move
+            move = resolve_pixel_move(changed, board)
             if move is None:
-                print(f"  ? Unresolved change: {changed}")
+                print(f"  ? Changed squares {changed} don't match any legal move")
+                # Reset reference to current frame to avoid getting stuck
+                detector.set_reference(warped)
                 continue
 
-            san = game.board.san(move)
-            game.apply_move(move)
+            san = board.san(move)
+            board.push(move)
+            move_history.append(move)
 
-            if game.whose_turn() == "white":
-                print(f"  {game.move_number() - 1}... {san}")
+            if board.turn == chess.WHITE:
+                # Black just moved
+                print(f"  {board.fullmove_number - 1}... {san}")
             else:
-                print(f"  {game.move_number()}. {san}")
+                # White just moved
+                print(f"  {board.fullmove_number}. {san}")
 
     except KeyboardInterrupt:
         print("\n\nStopped.")
     finally:
         cap.release()
         pgn = generate_pgn(
-            game.move_history,
+            move_history,
             white_name=args.white,
             black_name=args.black,
         )
         save_pgn(pgn, Path(args.output))
-        print(f"\nGame saved to {args.output} ({len(game.move_history)} moves)")
-        if game.move_history:
-            print(f"Final FEN: {game.get_fen()}")
+        print(f"\nGame saved to {args.output} ({len(move_history)} moves)")
+        if move_history:
+            print(f"Final FEN: {board.fen()}")
 
 
 if __name__ == "__main__":
