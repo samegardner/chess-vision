@@ -18,7 +18,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from chess_vision.board.detect import select_corners
-from chess_vision.board.auto_corners import auto_detect_corners
+from chess_vision.board.auto_corners import auto_detect_corners, XCornerDetector
 from chess_vision.inference.yolo_detect import (
     YoloPieceDetector, compute_square_centers, compute_crop_region,
     compute_board_quad,
@@ -28,6 +28,7 @@ from chess_vision.game.pgn import generate_pgn, save_pgn
 
 CORNERS_FILE = Path(__file__).parent.parent / "corners.json"
 MODEL_PATH = Path(__file__).parent.parent / "models" / "chesscam_pieces.onnx"
+XCORNERS_MODEL_PATH = Path(__file__).parent.parent / "models" / "chesscam_xcorners.onnx"
 
 
 def load_or_select_corners(frame, force_select=False):
@@ -117,16 +118,24 @@ def main():
     print(f"Camera ready: {frame.shape[1]}x{frame.shape[0]}")
 
     if args.auto_corners:
-        # Experimental: auto-detect from piece positions
-        print("Auto-detecting board corners (experimental)...")
-        dets = detector.detect_raw(frame)
-        corners = auto_detect_corners(dets)
-        if corners is None:
-            print("  Auto-detection failed. Falling back to manual.")
-            corners = select_corners(frame)
+        print("Auto-detecting board corners...")
+        if XCORNERS_MODEL_PATH.exists():
+            xcorner_det = XCornerDetector(str(XCORNERS_MODEL_PATH))
+            dets = detector.detect_raw(frame)
+            corners = auto_detect_corners(dets, xcorner_det, frame)
+            if corners is not None:
+                print(f"  Auto-detected corners: {corners.astype(int).tolist()}")
+                CORNERS_FILE.write_text(json.dumps(corners.tolist()))
+            else:
+                print("  Auto-detection failed. Falling back to manual.")
+                print("  Click corners in order: a1, a8, h8, h1")
+                corners = select_corners(frame)
+                CORNERS_FILE.write_text(json.dumps(corners.tolist()))
         else:
-            print(f"  Detected corners: {corners.astype(int).tolist()}")
-        CORNERS_FILE.write_text(json.dumps(corners.tolist()))
+            print(f"  Xcorners model not found at {XCORNERS_MODEL_PATH}")
+            print("  Falling back to manual selection.")
+            corners = select_corners(frame)
+            CORNERS_FILE.write_text(json.dumps(corners.tolist()))
     else:
         corners = load_or_select_corners(frame, force_select=args.select_corners)
     square_centers = compute_square_centers(corners, frame.shape)
