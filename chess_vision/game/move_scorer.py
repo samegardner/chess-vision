@@ -116,14 +116,21 @@ def calculate_score(state: np.ndarray, move: MoveData, threshold: float = 0.6) -
 class MoveDetectorV2:
     """ChessCam-style move detection with two-move lookahead and greedy fallback."""
 
-    def __init__(self, greedy_delay: float = 1.0):
+    def __init__(self, greedy_delay: float = 0.4):
         self.possible_moves: set[str] = set()
         self.greedy_times: dict[str, float] = {}
         self.greedy_delay = greedy_delay
         self.last_move_san: str = ""
+        self._cached_pairs: list[MovePair] | None = None
+        self._cached_fen: str = ""
 
     def detect_move(self, board: chess.Board, state: np.ndarray) -> str | None:
-        pairs = get_move_pairs(board)
+        # Cache move pairs (only recompute when position changes)
+        fen = board.board_fen() + str(board.turn)
+        if fen != self._cached_fen:
+            self._cached_pairs = get_move_pairs(board)
+            self._cached_fen = fen
+        pairs = self._cached_pairs
 
         best_score1 = float("-inf")
         best_score2 = float("-inf")

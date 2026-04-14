@@ -84,11 +84,11 @@ def main():
     parser.add_argument("--camera", type=int, default=0)
     parser.add_argument("--output", type=str, default="game.pgn")
     parser.add_argument("--select-corners", action="store_true")
-    parser.add_argument("--interval", type=float, default=0.3)
+    parser.add_argument("--interval", type=float, default=0.05)
     parser.add_argument("--white", type=str, default="White")
     parser.add_argument("--black", type=str, default="Black")
-    parser.add_argument("--ema", type=float, default=0.4)
-    parser.add_argument("--greedy-delay", type=float, default=1.0)
+    parser.add_argument("--ema", type=float, default=0.2)
+    parser.add_argument("--greedy-delay", type=float, default=0.4)
     parser.add_argument("--no-display", action="store_true")
     args = parser.parse_args()
 
@@ -123,8 +123,8 @@ def main():
     print(f"Initial detection: {len(dets)} pieces")
 
     # Warmup: build EMA state (no move detection yet)
-    WARMUP_FRAMES = 10
-    print(f"Stabilizing ({WARMUP_FRAMES * args.interval:.0f}s)...")
+    WARMUP_FRAMES = 30  # ~1.5s at 20 FPS
+    print("Stabilizing (~1.5s)...")
     for _ in range(WARMUP_FRAMES):
         time.sleep(args.interval)
         ret, frame = cap.read()
@@ -151,11 +151,13 @@ def main():
     print()
 
     frames_since_last_move = 0
-    UNDO_CHECK_FRAMES = 5  # Check for undo after this many frames
+    frame_count = 0
+    UNDO_CHECK_FRAMES = 15  # ~0.75s at 20 FPS
 
     try:
         while not board.is_game_over():
-            time.sleep(args.interval)
+            loop_start = time.monotonic()
+
             ret, frame = cap.read()
             if not ret:
                 continue
@@ -164,13 +166,15 @@ def main():
             update = detector.detections_to_board(dets, square_centers, board_quad)
             detector.update_state(update)
             frames_since_last_move += 1
+            frame_count += 1
 
-            if not args.no_display:
+            # Draw debug every 3rd frame (saves CPU, still smooth enough)
+            if not args.no_display and frame_count % 3 == 0:
                 debug = draw_debug(frame, dets, square_centers, board, last_move_san, corners)
                 cv2.imshow("Chess Vision", debug)
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord("q"):
-                    break
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                break
 
             # Undo check: if last move still looks wrong after a few frames, take it back
             if (move_history and frames_since_last_move == UNDO_CHECK_FRAMES):
@@ -201,6 +205,12 @@ def main():
                 print(f"  {board.fullmove_number - 1}... {san}")
             else:
                 print(f"  {board.fullmove_number}. {san}")
+
+            # Sleep only the remaining time to hit target interval
+            elapsed = time.monotonic() - loop_start
+            remaining = max(0, args.interval - elapsed)
+            if remaining > 0:
+                time.sleep(remaining)
 
     except KeyboardInterrupt:
         print("\n\nStopped.")
