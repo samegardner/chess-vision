@@ -173,10 +173,9 @@ class YoloPieceDetector:
 
 def compute_crop_region(corners: np.ndarray, padding: float = 0.15) -> tuple[int, int, int, int]:
     """Compute a bounding box around the board corners with padding."""
-    from chess_vision.board.warp import order_corners
-    ordered = order_corners(corners)
-    xs = ordered[:, 0]
-    ys = ordered[:, 1]
+    corners = corners.reshape(4, 2)
+    xs = corners[:, 0]
+    ys = corners[:, 1]
     x1, x2 = float(xs.min()), float(xs.max())
     y1, y2 = float(ys.min()), float(ys.max())
     w = x2 - x1
@@ -189,42 +188,43 @@ def compute_crop_region(corners: np.ndarray, padding: float = 0.15) -> tuple[int
 
 
 def compute_board_quad(corners: np.ndarray) -> np.ndarray:
-    """Get the ordered board quadrilateral for point-in-quad filtering."""
-    from chess_vision.board.warp import order_corners
-    return order_corners(corners)
+    """Get the board quadrilateral for point-in-quad filtering.
+
+    Corners are in [a1, a8, h8, h1] order from select_corners.
+    """
+    return corners.reshape(4, 2).astype(np.float32)
 
 
 def compute_square_centers(corners: np.ndarray, image_shape: tuple) -> np.ndarray:
-    """Compute the 64 square center positions in image space using perspective transform.
+    """Compute the 64 square center positions in image space.
 
-    Uses the inverse homography to map ideal board coordinates to image pixels.
-    This correctly handles perspective distortion (bottom squares appear larger
-    than top squares when viewed at an angle).
+    Corners must be in [a1, a8, h8, h1] order (from select_corners).
+    Uses homography to correctly handle perspective distortion.
 
     Indexed 0=a1, 1=b1, ..., 63=h8.
     """
-    from chess_vision.board.warp import order_corners
+    corners = corners.reshape(4, 2).astype(np.float32)
+    a1, a8, h8, h1 = corners
 
-    ordered = order_corners(corners)  # TL, TR, BR, BL
-
-    # Compute homography from ideal board (800x800) to image
-    # In ideal board: TL=(0,0), TR=(800,0), BR=(800,800), BL=(0,800)
-    # Rank 8 is at top (y=0), rank 1 is at bottom (y=800)
+    # Ideal board: 800x800, a1 at bottom-left, h8 at top-right
+    # a1=(0,800), a8=(0,0), h8=(800,0), h1=(800,800)
     ideal_corners = np.array([
-        [0, 0], [800, 0], [800, 800], [0, 800]
+        [0, 800],    # a1
+        [0, 0],      # a8
+        [800, 0],    # h8
+        [800, 800],  # h1
     ], dtype=np.float32)
 
-    H, _ = cv2.findHomography(ideal_corners, ordered)
+    H, _ = cv2.findHomography(ideal_corners, corners)
 
     centers = np.zeros((64, 2), dtype=np.float32)
     for rank in range(8):
         for file in range(8):
-            # In ideal board: file 0 (a) = x=50, file 7 (h) = x=750
-            # rank 1 = bottom = y=750, rank 8 = top = y=50
-            ideal_x = (file + 0.5) * 100  # 50, 150, ..., 750
-            ideal_y = (7 - rank + 0.5) * 100  # rank 1 -> y=750, rank 8 -> y=50
+            # a-file = x=50, h-file = x=750
+            # rank 1 = y=750 (bottom), rank 8 = y=50 (top)
+            ideal_x = (file + 0.5) * 100
+            ideal_y = (7 - rank + 0.5) * 100
 
-            # Transform through homography
             pt = np.array([[[ideal_x, ideal_y]]], dtype=np.float32)
             transformed = cv2.perspectiveTransform(pt, H)
             centers[rank * 8 + file] = transformed[0, 0]

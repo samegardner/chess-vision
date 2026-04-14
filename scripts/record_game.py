@@ -18,7 +18,6 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from chess_vision.board.detect import select_corners
-from chess_vision.board.warp import order_corners
 from chess_vision.inference.yolo_detect import (
     YoloPieceDetector, compute_square_centers, compute_crop_region,
     compute_board_quad,
@@ -44,8 +43,7 @@ def load_or_select_corners(frame, force_select=False):
 
 def draw_debug(frame, detections, square_centers, board, last_move_san, corners):
     overlay = frame.copy()
-    ordered = order_corners(corners)
-    pts = ordered.astype(int)
+    pts = corners.reshape(4, 2).astype(int)
     for i in range(4):
         cv2.line(overlay, tuple(pts[i]), tuple(pts[(i + 1) % 4]), (0, 255, 0), 2)
 
