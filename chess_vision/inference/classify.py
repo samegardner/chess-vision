@@ -4,11 +4,13 @@ import cv2
 import numpy as np
 from PIL import Image
 
+import json
+
 from chess_vision.inference.onnx_runtime import ONNXClassifier
 from chess_vision.board.squares import square_index_to_name
 from chess_vision.models.piece import PIECE_CLASSES, PIECE_TO_FEN
 from chess_vision.training.augment import get_eval_transforms
-from chess_vision.config import INPUT_SIZE
+from chess_vision.config import INPUT_SIZE, MODELS_DIR
 
 
 def _prepare_batch(square_images: list[np.ndarray], input_size: int = INPUT_SIZE) -> np.ndarray:
@@ -58,9 +60,24 @@ def classify_board(
         piece_logits = piece_model.predict(piece_batch)  # (N, 12)
         pred_classes = np.argmax(piece_logits, axis=1)
 
+        # Load class ordering from training (may differ from PIECE_CLASSES)
+        classes_file = MODELS_DIR / "piece_classes.json"
+        if classes_file.exists():
+            piece_class_order = json.load(open(classes_file))
+        else:
+            piece_class_order = PIECE_CLASSES
+
+        # FEN mapping for the training class order
+        class_to_fen = {
+            "white_pawn": "P", "white_knight": "N", "white_bishop": "B",
+            "white_rook": "R", "white_queen": "Q", "white_king": "K",
+            "black_pawn": "p", "black_knight": "n", "black_bishop": "b",
+            "black_rook": "r", "black_queen": "q", "black_king": "k",
+        }
+
         for i, idx in enumerate(occupied_indices):
-            class_name = PIECE_CLASSES[pred_classes[i]]
-            board_state[square_index_to_name(idx)] = PIECE_TO_FEN[class_name]
+            class_name = piece_class_order[pred_classes[i]]
+            board_state[square_index_to_name(idx)] = class_to_fen[class_name]
 
     # Fill in empty squares
     for i in range(64):

@@ -146,8 +146,24 @@ def main():
     H = compute_homography(corners)
 
     # Import the batch preparation function
+    import json
     from chess_vision.inference.classify import _prepare_batch
     from chess_vision.models.piece import PIECE_CLASSES, PIECE_TO_FEN
+
+    # Load class ordering from training
+    classes_file = project_root / "models" / "piece_classes.json"
+    if classes_file.exists():
+        piece_class_order = json.load(open(classes_file))
+        print(f"Using class ordering from {classes_file}")
+    else:
+        piece_class_order = PIECE_CLASSES
+
+    class_to_fen = {
+        "white_pawn": "P", "white_knight": "N", "white_bishop": "B",
+        "white_rook": "R", "white_queen": "Q", "white_king": "K",
+        "black_pawn": "p", "black_knight": "n", "black_bishop": "b",
+        "black_rook": "r", "black_queen": "q", "black_king": "k",
+    }
 
     print()
     print("=== LIVE DEBUG ===")
@@ -178,9 +194,9 @@ def main():
             pred_classes = np.argmax(piece_logits, axis=1)
 
             for j, idx in enumerate(occupied_indices):
-                class_name = PIECE_CLASSES[pred_classes[j]]
+                class_name = piece_class_order[pred_classes[j]]
                 sq_name = square_index_to_name(idx)
-                board_state[sq_name] = PIECE_TO_FEN[class_name]
+                board_state[sq_name] = class_to_fen[class_name]
 
         # Fill empty squares
         for i in range(64):
