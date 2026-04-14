@@ -1,7 +1,7 @@
-"""Record a chess game using ChessCam's YOLO model + EMA smoothing.
+"""Record a chess game using ChessCam's YOLO model + move scoring.
 
-Uses a pretrained LeYOLO model for piece detection, exponential moving
-average for temporal smoothing, and python-chess legal move scoring.
+Uses pretrained LeYOLO for piece detection, EMA smoothing, and
+ChessCam-style two-move lookahead with greedy fallback.
 
 Usage:
     python scripts/record_game.py
@@ -23,8 +23,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from chess_vision.board.detect import select_corners
 from chess_vision.board.warp import order_corners
 from chess_vision.inference.yolo_detect import (
-    YoloPieceDetector, compute_square_centers, YOLO_CLASSES, YOLO_TO_FEN,
+    YoloPieceDetector, compute_square_centers, YOLO_CLASSES,
 )
+from chess_vision.game.move_scorer import MoveDetectorV2
 from chess_vision.game.pgn import generate_pgn, save_pgn
 
 CORNERS_FILE = Path(__file__).parent.parent / "corners.json"
@@ -43,86 +44,13 @@ def load_or_select_corners(frame, force_select=False):
     return corners
 
 
-def score_move(move: chess.Move, board: chess.Board, state: np.ndarray) -> float:
-    """Score how well the current state matrix matches a move being played.
-
-    Checks: do the 'from' squares look empty? Do the 'to' squares have
-    the expected piece? Higher score = better match.
-    """
-    score = 0.0
-    threshold = 0.3
-
-    # Simulate the move
-    from_sq = move.from_square
-    to_sq = move.to_square
-    piece = board.piece_at(from_sq)
-    if piece is None:
-        return -999
-
-    # From square should now be empty (low occupancy)
-    from_max = float(np.max(state[from_sq]))
-    score += (threshold - from_max)  # Positive if square looks empty
-
-    # To square should have the moved piece
-    piece_sym = piece.symbol()
-    if move.promotion:
-        piece_sym = chess.piece_symbol(move.promotion)
-        if piece.color == chess.WHITE:
-            piece_sym = piece_sym.upper()
-
-    if piece_sym in YOLO_CLASSES:
-        class_idx = YOLO_CLASSES.index(piece_sym)
-        to_score = float(state[to_sq, class_idx])
-        score += (to_score - threshold)
-
-    # Castling: rook should also move
-    if board.is_castling(move):
-        rank = 0 if board.turn == chess.WHITE else 7
-        if board.is_kingside_castling(move):
-            rook_from = chess.square(7, rank)
-            rook_to = chess.square(5, rank)
-        else:
-            rook_from = chess.square(0, rank)
-            rook_to = chess.square(3, rank)
-
-        score += (threshold - float(np.max(state[rook_from])))
-        rook_sym = "R" if board.turn == chess.WHITE else "r"
-        rook_class = YOLO_CLASSES.index(rook_sym)
-        score += (float(state[rook_to, rook_class]) - threshold)
-
-    # En passant: captured pawn should disappear
-    if board.is_en_passant(move):
-        cap_sq = chess.square(chess.square_file(to_sq), chess.square_rank(from_sq))
-        score += (threshold - float(np.max(state[cap_sq])))
-
-    return score
-
-
-def find_best_move(board: chess.Board, state: np.ndarray, min_score: float = 0.25) -> chess.Move | None:
-    """Find the legal move that best matches the current state matrix."""
-    best_move = None
-    best_score = min_score  # Minimum threshold to accept
-
-    for move in board.legal_moves:
-        s = score_move(move, board, state)
-        if s > best_score:
-            best_score = s
-            best_move = move
-
-    return best_move
-
-
 def draw_debug(frame, detections, square_centers, board, last_move_san, corners):
-    """Draw debug overlay on the camera frame."""
     overlay = frame.copy()
-
-    # Draw board outline
     ordered = order_corners(corners)
     pts = ordered.astype(int)
     for i in range(4):
         cv2.line(overlay, tuple(pts[i]), tuple(pts[(i + 1) % 4]), (0, 255, 0), 2)
 
-    # Draw detections as bounding boxes
     for det in detections:
         x1 = int(det["cx"] - det["w"] / 2)
         y1 = int(det["cy"] - det["h"] / 2)
@@ -133,21 +61,12 @@ def draw_debug(frame, detections, square_centers, board, last_move_san, corners)
         label = f"{det['class_name']} {det['confidence']:.0%}"
         cv2.putText(overlay, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
 
-    # Draw square centers
-    for i, center in enumerate(square_centers):
-        sq = chess.square_name(i)
-        piece = board.piece_at(i)
-        if piece:
-            cv2.circle(overlay, tuple(center.astype(int)), 3, (255, 255, 0), -1)
-
-    # Status
     turn = "White" if board.turn == chess.WHITE else "Black"
     status = f"{turn} | Move {board.fullmove_number}"
     if last_move_san:
         status += f" | Last: {last_move_san}"
     h = frame.shape[0]
     cv2.putText(overlay, status, (10, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-
     return overlay
 
 
@@ -159,20 +78,19 @@ def main():
     parser.add_argument("--interval", type=float, default=0.3)
     parser.add_argument("--white", type=str, default="White")
     parser.add_argument("--black", type=str, default="Black")
-    parser.add_argument("--ema", type=float, default=0.5, help="EMA decay (0=no smoothing, 1=infinite memory)")
+    parser.add_argument("--ema", type=float, default=0.5)
+    parser.add_argument("--greedy-delay", type=float, default=1.5,
+                        help="Seconds a move must be top candidate before greedy accept")
     parser.add_argument("--no-display", action="store_true")
     args = parser.parse_args()
 
     if not MODEL_PATH.exists():
         print(f"Model not found: {MODEL_PATH}")
-        print("Download from: https://drive.google.com/file/d/1-80xp_nly9i6s3o0mF0mU9OZGEzUAlGj")
         return
 
-    # Load YOLO model
     print("Loading YOLO piece detector...")
     detector = YoloPieceDetector(str(MODEL_PATH), ema_decay=args.ema)
 
-    # Open camera
     cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
         print(f"Could not open camera {args.camera}")
@@ -187,17 +105,12 @@ def main():
         return
     print(f"Camera ready: {frame.shape[1]}x{frame.shape[0]}")
 
-    # Get corners
     corners = load_or_select_corners(frame, force_select=args.select_corners)
     square_centers = compute_square_centers(corners, frame.shape)
 
-    # Quick test: run detection on first frame
-    dets = detector.detect_raw(frame)
-    print(f"Initial detection: {len(dets)} pieces found")
-
-    # Warmup: let EMA stabilize on starting position before accepting moves
-    WARMUP_FRAMES = 20  # ~6 seconds at 0.3s interval
-    print(f"Stabilizing ({WARMUP_FRAMES * args.interval:.0f}s warmup)...")
+    # Warmup: let EMA stabilize
+    WARMUP_FRAMES = 15
+    print(f"Stabilizing ({WARMUP_FRAMES * args.interval:.0f}s)...")
     for i in range(WARMUP_FRAMES):
         time.sleep(args.interval)
         ret, frame = cap.read()
@@ -209,16 +122,13 @@ def main():
                 debug = draw_debug(frame, dets, square_centers, chess.Board(), "", corners)
                 cv2.imshow("Chess Vision", debug)
                 cv2.waitKey(1)
-        if (i + 1) % 5 == 0:
-            print(f"  {i + 1}/{WARMUP_FRAMES} frames...")
+
     print("Ready!")
 
-    # Game state
     board = chess.Board()
     move_history: list[chess.Move] = []
     last_move_san = ""
-    frames_since_move = 0
-    MIN_FRAMES_BETWEEN_MOVES = 8  # ~2.4s at 0.3s interval
+    move_detector = MoveDetectorV2(greedy_delay=args.greedy_delay)
 
     print()
     print("=== RECORDING ===")
@@ -235,14 +145,10 @@ def main():
             if not ret:
                 continue
 
-            # Detect pieces
             dets = detector.detect_raw(frame)
             update = detector.detections_to_board(dets, square_centers)
             detector.update_state(update)
 
-            frames_since_move += 1
-
-            # Show debug
             if not args.no_display:
                 debug = draw_debug(frame, dets, square_centers, board, last_move_san, corners)
                 cv2.imshow("Chess Vision", debug)
@@ -250,20 +156,15 @@ def main():
                 if key == ord("q"):
                     break
 
-            # Don't check for moves too soon after the last one
-            if frames_since_move < MIN_FRAMES_BETWEEN_MOVES:
+            # Check for moves using ChessCam-style scoring
+            san = move_detector.detect_move(board, detector.state)
+            if san is None:
                 continue
 
-            # Find best matching legal move
-            move = find_best_move(board, detector.state)
-            if move is None:
-                continue
-
-            san = board.san(move)
+            move = board.parse_san(san)
             board.push(move)
             move_history.append(move)
             last_move_san = san
-            frames_since_move = 0
 
             if board.turn == chess.WHITE:
                 print(f"  {board.fullmove_number - 1}... {san}")
