@@ -82,12 +82,25 @@ def _find_board_corners_from_xcorners(xcorners: np.ndarray) -> np.ndarray | None
     right_dir = (br - tr) / (np.linalg.norm(br - tr) + 1e-8)
     bottom_dir = (br - bl) / (np.linalg.norm(br - bl) + 1e-8)
 
-    # Each corner pushes outward by 1.2 cells along both edges (1 cell to edge + margin)
-    expand = 1.2
-    board_tl = tl - top_dir * cell_w * expand - left_dir * cell_h * expand
-    board_tr = tr + top_dir * cell_w * expand - right_dir * cell_h * expand
-    board_br = br + bottom_dir * cell_w * expand + right_dir * cell_h * expand
-    board_bl = bl - bottom_dir * cell_w * expand + left_dir * cell_h * expand
+    # Use the perspective transform to extrapolate properly.
+    # Fit a homography from the xcorner extremes to an ideal 6x6 grid,
+    # then inverse-transform the board corners (at -1 and 7 in grid space).
+    src = np.array([tl, tr, br, bl], dtype=np.float32)
+    dst = np.array([[0, 0], [6, 0], [6, 6], [0, 6]], dtype=np.float32)
+
+    try:
+        H = cv2.getPerspectiveTransform(dst, src)
+        # Board corners in grid space are at (-1, -1), (7, -1), (7, 7), (-1, 7)
+        grid_corners = np.array([[[-1, -1]], [[7, -1]], [[7, 7]], [[-1, 7]]], dtype=np.float32)
+        board_pts = cv2.perspectiveTransform(grid_corners, H).reshape(4, 2)
+        board_tl, board_tr, board_br, board_bl = board_pts
+    except Exception:
+        # Fallback to simple expansion
+        expand = 1.2
+        board_tl = tl - top_dir * cell_w * expand - left_dir * cell_h * expand
+        board_tr = tr + top_dir * cell_w * expand - right_dir * cell_h * expand
+        board_br = br + bottom_dir * cell_w * expand + right_dir * cell_h * expand
+        board_bl = bl - bottom_dir * cell_w * expand + left_dir * cell_h * expand
 
     return np.array([board_tl, board_tr, board_br, board_bl], dtype=np.float32)
 
