@@ -49,7 +49,20 @@ def draw_debug(frame, detections, square_centers, board, last_move_san, corners)
     for i in range(4):
         cv2.line(overlay, tuple(pts[i]), tuple(pts[(i + 1) % 4]), (0, 255, 0), 2)
 
+    # Keep only the best detection per square (avoids duplicate boxes)
+    best_per_square: dict[int, dict] = {}
     for det in detections:
+        piece_x = det["cx"]
+        piece_y = det["cy"] + det["h"] / 2 - det["w"] / 3
+        dists = np.sqrt(
+            (square_centers[:, 0] - piece_x) ** 2
+            + (square_centers[:, 1] - piece_y) ** 2
+        )
+        sq = int(np.argmin(dists))
+        if sq not in best_per_square or det["confidence"] > best_per_square[sq]["confidence"]:
+            best_per_square[sq] = det
+
+    for det in best_per_square.values():
         x1 = int(det["cx"] - det["w"] / 2)
         y1 = int(det["cy"] - det["h"] / 2)
         x2 = int(det["cx"] + det["w"] / 2)
