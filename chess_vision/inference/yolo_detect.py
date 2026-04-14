@@ -39,16 +39,19 @@ def letterbox_resize(image: np.ndarray, target_w: int, target_h: int, pad_value:
 
 
 def point_in_quad(point: np.ndarray, quad: np.ndarray) -> bool:
-    """Check if a point is inside a quadrilateral using cross-product test."""
+    """Check if a point is inside a quadrilateral using cross-product test.
+
+    Handles both clockwise and counterclockwise winding order.
+    """
     px, py = point
     n = len(quad)
+    crosses = []
     for i in range(n):
         x1, y1 = quad[i]
         x2, y2 = quad[(i + 1) % n]
-        cross = (x2 - x1) * (py - y1) - (y2 - y1) * (px - x1)
-        if cross < 0:
-            return False
-    return True
+        crosses.append((x2 - x1) * (py - y1) - (y2 - y1) * (px - x1))
+    # All same sign = inside (works for both CW and CCW)
+    return all(c >= 0 for c in crosses) or all(c <= 0 for c in crosses)
 
 
 class YoloPieceDetector:
