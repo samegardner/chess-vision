@@ -44,13 +44,17 @@ def load_or_select_corners(frame, force_select=False):
     return corners
 
 
-def draw_debug(frame, detections, square_centers, board, last_move_san, corners):
+def draw_debug(frame, detections, square_centers, board, move_history, corners,
+               hand_on_board=False):
     overlay = frame.copy()
+    h, w = overlay.shape[:2]
+
+    # Board outline
     pts = corners.reshape(4, 2).astype(int)
     for i in range(4):
         cv2.line(overlay, tuple(pts[i]), tuple(pts[(i + 1) % 4]), (0, 255, 0), 2)
 
-    # Keep only the best detection per square (avoids duplicate boxes)
+    # Best detection per square
     best_per_square: dict[int, dict] = {}
     for det in detections:
         piece_x = det["cx"]
@@ -73,13 +77,55 @@ def draw_debug(frame, detections, square_centers, board, last_move_san, corners)
         label = f"{det['class_name']} {det['confidence']:.0%}"
         cv2.putText(overlay, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
 
+    # Move list panel (right side)
+    panel_w = 220
+    panel = np.zeros((h, panel_w, 3), dtype=np.uint8)
+    panel[:] = (30, 30, 30)  # Dark background
+
+    # Title
     turn = "White" if board.turn == chess.WHITE else "Black"
-    status = f"{turn} | Move {board.fullmove_number}"
-    if last_move_san:
-        status += f" | Last: {last_move_san}"
-    h = frame.shape[0]
-    cv2.putText(overlay, status, (10, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-    return overlay
+    cv2.putText(panel, "Chess Vision", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    cv2.putText(panel, f"Move {board.fullmove_number} | {turn}", (10, 60),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+
+    if hand_on_board:
+        cv2.putText(panel, "HAND DETECTED", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+
+    # Move list
+    y_start = 120
+    line_height = 22
+    max_moves_shown = (h - y_start - 40) // line_height
+
+    # Build move text pairs (1. e4 e5  2. Nf3 Nc6 ...)
+    move_lines = []
+    temp_board = chess.Board()
+    for i, move in enumerate(move_history):
+        san = temp_board.san(move)
+        temp_board.push(move)
+        if i % 2 == 0:
+            move_lines.append(f"{i // 2 + 1}. {san}")
+        else:
+            move_lines[-1] += f"  {san}"
+
+    # Show last N moves that fit
+    if len(move_lines) > max_moves_shown:
+        move_lines = move_lines[-max_moves_shown:]
+
+    for i, line in enumerate(move_lines):
+        y = y_start + i * line_height
+        # Highlight the last line
+        if i == len(move_lines) - 1:
+            cv2.putText(panel, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
+        else:
+            cv2.putText(panel, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
+
+    # Move count at bottom
+    cv2.putText(panel, f"{len(move_history)} moves recorded", (10, h - 15),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (150, 150, 150), 1)
+
+    # Combine frame + panel
+    combined = np.hstack([overlay, panel])
+    return combined
 
 
 def main():
@@ -205,7 +251,7 @@ def main():
                         square_centers = compute_square_centers(corners, frame.shape)
                         crop_region = compute_crop_region(corners)
                         board_quad = compute_board_quad(corners)
-                        print(f"  (board shifted, recalibrated)")
+                        pass  # Recalibration is silent
 
             dets = detector.detect_raw(frame, crop_region=crop_region)
             update = detector.detections_to_board(dets, square_centers, board_quad)
@@ -224,10 +270,8 @@ def main():
 
             # Draw debug every 3rd frame
             if not args.no_display and frame_count % 3 == 0:
-                debug = draw_debug(frame, dets, square_centers, board, last_move_san, corners)
-                if hand_on_board:
-                    cv2.putText(debug, "HAND DETECTED", (10, 50),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
+                debug = draw_debug(frame, dets, square_centers, board, move_history, corners,
+                                   hand_on_board=hand_on_board)
                 cv2.imshow("Chess Vision", debug)
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
@@ -250,7 +294,7 @@ def main():
                     undone = move_history.pop()
                     last_move_san = move_history[-1].uci() if move_history else ""
                     greedy_pending = False
-                    print(f"  (undid {chess.square_name(undone.from_square)}{chess.square_name(undone.to_square)})")
+                    # Undo shown in display window via move_history update
                     continue
                 else:
                     # Move confirmed, no longer pending
@@ -267,10 +311,7 @@ def main():
             frames_since_last_move = 0
             greedy_pending = True  # All moves start as tentative
 
-            if board.turn == chess.WHITE:
-                print(f"  {board.fullmove_number - 1}... {san}")
-            else:
-                print(f"  {board.fullmove_number}. {san}")
+            # Moves are shown in the display window, not terminal
 
             # Sleep only the remaining time to hit target interval
             elapsed = time.monotonic() - loop_start
