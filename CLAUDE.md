@@ -1,83 +1,58 @@
 # chess-vision
 
-CNN-powered chess board recognition from a USB camera. Records OTB games as PGN files.
+Records OTB chess games using a USB camera. Outputs PGN files.
 
-## Architecture
+## How it works
 
-Two-stage CNN pipeline:
-1. **Board detection**: Hough lines + RANSAC corner detection, homography warp to 800x800
-2. **Occupancy CNN**: ResNet-18 binary classifier (empty vs occupied)
-3. **Piece CNN**: ResNet-18 12-class classifier (6 piece types x 2 colors)
-4. **Move detection**: Square-level frame differencing with 5-frame stability window
-5. **Game logic**: python-chess for legal move validation, FEN/PGN generation
+1. Camera captures frames of the board
+2. ChessCam's pretrained LeYOLO model detects pieces with bounding boxes
+3. Detections mapped to squares via perspective transform
+4. EMA smoothing stabilizes predictions across frames
+5. Legal moves scored against the state matrix (ChessCam's approach)
+6. Two-move lookahead + greedy fallback with 1s confirmation
+7. python-chess validates and tracks game state
+8. PGN exported on quit
 
-## Key commands
+## Usage
 
 ```bash
-chess-vision calibrate --name "set-name"     # Calibrate for a chess set
-chess-vision record --profile "set-name"     # Record a game
-chess-vision train --stage base              # Train base models
-chess-vision detect --image photo.jpg        # One-shot board detection
-chess-vision list-profiles                   # List calibration profiles
+# Record a game (select corners first time)
+python scripts/record_game.py --select-corners --white "Sam" --black "Opponent"
+
+# Use saved corners
+python scripts/record_game.py --white "Sam" --black "Opponent"
+
+# Adjust sensitivity
+python scripts/record_game.py --ema 0.3 --greedy-delay 0.8
 ```
+
+## Project layout (active files only)
+
+```
+scripts/record_game.py              # Main recording script
+chess_vision/inference/yolo_detect.py  # YOLO detection + EMA + square mapping
+chess_vision/game/move_scorer.py       # Move scoring (two-move lookahead)
+chess_vision/game/pgn.py               # PGN generation
+chess_vision/board/detect.py           # Manual corner selection
+chess_vision/board/warp.py             # Corner ordering + homography
+models/chesscam_pieces.onnx            # Pretrained LeYOLO model (4MB)
+corners.json                           # Saved board corners
+```
+
+## Key technical details
+
+- Model: ChessCam's LeYOLO (480x288 input, 12 piece classes, float16)
+- Preprocessing: letterbox resize with gray padding (114), matching ChessCam
+- Anchor point: bottom of box minus width/3 (piece base, not box center)
+- Square centers: computed via inverse homography (handles perspective)
+- Out-of-board filtering: point-in-quad test discards off-board detections
+- EMA decay: 0.4 (state reacts to changes in ~2 frames)
+- Greedy delay: 1.0s (move must be top candidate for 1 second)
+- Undo mechanism: if a move looks wrong after 5 frames, automatically reverts
 
 ## Development
 
 ```bash
-cd ~/Personal/Projects/chess-vision
 source .venv/bin/activate
-pip install -e ".[dev]"
-pytest
+pytest  # Run tests
 ```
-
-Virtual environment is at `.venv/` (Python 3.13). Always activate before running commands.
-
-## Training pipeline
-
-```bash
-# 1. Download and process training data (chesscog synthetic dataset from OSF)
-python scripts/download_data.py --dataset chesscog
-
-# 2. Train base models (uses MPS on Apple Silicon)
-chess-vision train --stage base --epochs 20
-
-# 3. Models saved to models/occupancy.onnx and models/piece.onnx
-```
-
-Training data goes to `data/chesscog/` (raw) and `data/processed/` (per-square crops). Both are gitignored.
-
-## Project layout
-
-- `chess_vision/board/` - Board detection, perspective warp, square extraction
-- `chess_vision/models/` - CNN model definitions (ResNet-18), ONNX export. **Single source of truth for PIECE_CLASSES and PIECE_TO_FEN** (in `piece.py`)
-- `chess_vision/training/` - Dataset classes (ImageFolder), augmentation, training loop (Adam + cosine LR + early stopping)
-- `chess_vision/inference/` - Camera wrapper, ONNX Runtime inference, full board classification pipeline
-- `chess_vision/game/` - Game state, move detection (frame diff + stability window), legal move resolution (handles castling, en passant, promotion), PGN export
-- `chess_vision/calibration/` - Guided photo capture, auto-labeling from starting position, per-set fine-tuning, profile management (YAML)
-- `scripts/` - Dataset download/processing, debug visualization
-- `config/default.yaml` - All configurable parameters (note: config loading exists but module constants are currently hardcoded, not populated from YAML)
-
-## Key design decisions
-
-- **Two-stage classification** (occupancy then piece type) is proven more accurate than single 13-class. Occupancy filters 60% of squares so piece model only runs on ~16-32 squares.
-- **ONNX Runtime** for inference (2-5x faster than PyTorch on CPU, no GPU required at inference time)
-- **50% contextual padding** on square crops captures full piece silhouette at angled camera views
-- **Legal move validation** as error correction: python-chess constrains CNN output to only legal moves, dramatically reducing effective error rate
-- **Per-set calibration**: 2 photos of starting position (128 labeled squares) fine-tune both models via transfer learning
-- **Board orientation**: auto-detected from starting position, `remap_board_state()` handles 180-degree flip when playing as black
-
-## Known limitations
-
-- Board detection uses traditional CV (Hough lines), not ML. Works well on clean boards but may struggle with cluttered backgrounds or poor lighting.
-- Cached homography during recording means a shifted camera produces wrong classifications with no warning. Periodic re-detection is planned but not yet implemented.
-- Config YAML (`config/default.yaml`) is defined but module constants are hardcoded. `load_config()` exists but doesn't update the constants.
-
-## Testing
-
-```bash
-pytest                    # Run all tests (55 tests)
-pytest tests/test_rules.py  # Run specific test file
-pytest -v --tb=short      # Verbose with short tracebacks
-```
-
-Tests use synthetic checkerboard images for board detection. No camera or GPU required.

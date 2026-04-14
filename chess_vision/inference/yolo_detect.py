@@ -184,7 +184,7 @@ def compute_crop_region(corners: np.ndarray, padding: float = 0.15) -> tuple[int
     x1 -= w * padding
     y1 -= h * padding * 2  # More padding on top for tall pieces
     x2 += w * padding
-    y2 += h * padding
+    y2 += h * padding * 1.5  # More padding on bottom for close-to-camera pieces
     return (int(x1), int(y1), int(x2), int(y2))
 
 

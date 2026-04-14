@@ -76,7 +76,7 @@ def main():
     parser.add_argument("--interval", type=float, default=0.3)
     parser.add_argument("--white", type=str, default="White")
     parser.add_argument("--black", type=str, default="Black")
-    parser.add_argument("--ema", type=float, default=0.5)
+    parser.add_argument("--ema", type=float, default=0.4)
     parser.add_argument("--greedy-delay", type=float, default=1.0)
     parser.add_argument("--no-display", action="store_true")
     args = parser.parse_args()
@@ -139,6 +139,9 @@ def main():
     print(board)
     print()
 
+    frames_since_last_move = 0
+    UNDO_CHECK_FRAMES = 5  # Check for undo after this many frames
+
     try:
         while not board.is_game_over():
             time.sleep(args.interval)
@@ -149,6 +152,7 @@ def main():
             dets = detector.detect_raw(frame, crop_region=crop_region)
             update = detector.detections_to_board(dets, square_centers, board_quad)
             detector.update_state(update)
+            frames_since_last_move += 1
 
             if not args.no_display:
                 debug = draw_debug(frame, dets, square_centers, board, last_move_san, corners)
@@ -156,6 +160,21 @@ def main():
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q"):
                     break
+
+            # Undo check: if last move still looks wrong after a few frames, take it back
+            if (move_history and frames_since_last_move == UNDO_CHECK_FRAMES):
+                last_move = move_history[-1]
+                from_sq = last_move.from_square
+                to_sq = last_move.to_square
+                # If the from-square still looks occupied, the move was probably wrong
+                from_occ = float(np.max(detector.state[from_sq]))
+                to_occ = float(np.max(detector.state[to_sq]))
+                if from_occ > 0.5 and to_occ < 0.3:
+                    board.pop()
+                    undone = move_history.pop()
+                    last_move_san = move_history[-1].uci() if move_history else ""
+                    print(f"  (undid {chess.square_name(undone.from_square)}{chess.square_name(undone.to_square)}, looked wrong)")
+                    continue
 
             san = move_detector.detect_move(board, detector.state)
             if san is None:
@@ -165,6 +184,7 @@ def main():
             board.push(move)
             move_history.append(move)
             last_move_san = san
+            frames_since_last_move = 0
 
             if board.turn == chess.WHITE:
                 print(f"  {board.fullmove_number - 1}... {san}")
