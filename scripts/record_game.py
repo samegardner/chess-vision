@@ -164,17 +164,33 @@ def main():
 
             dets = detector.detect_raw(frame, crop_region=crop_region)
             update = detector.detections_to_board(dets, square_centers, board_quad)
-            detector.update_state(update)
+
+            # Hand detection: if piece count drops significantly, freeze state
+            expected_pieces = len([sq for sq in chess.SQUARES if board.piece_at(sq)])
+            detected_pieces = int(np.sum(np.max(update, axis=1) > 0.3))
+            hand_on_board = detected_pieces < expected_pieces * 0.6
+
+            if not hand_on_board:
+                detector.update_state(update)
+            # else: don't update EMA, hand is blocking pieces
+
             frames_since_last_move += 1
             frame_count += 1
 
-            # Draw debug every 3rd frame (saves CPU, still smooth enough)
+            # Draw debug every 3rd frame
             if not args.no_display and frame_count % 3 == 0:
                 debug = draw_debug(frame, dets, square_centers, board, last_move_san, corners)
+                if hand_on_board:
+                    cv2.putText(debug, "HAND DETECTED", (10, 50),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
                 cv2.imshow("Chess Vision", debug)
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
                 break
+
+            # Don't check for moves while hand is on board
+            if hand_on_board:
+                continue
 
             # Undo check: if last move still looks wrong after a few frames, take it back
             if (move_history and frames_since_last_move == UNDO_CHECK_FRAMES):
