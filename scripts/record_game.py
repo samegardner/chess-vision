@@ -300,7 +300,6 @@ def main():
                 )
             else:
                 # Pixel-only fallback
-                from chess_vision.game.pixel_moves import PixelMoveDetector
                 changed_set = set(changed)
                 move = None
                 for m in board.legal_moves:
