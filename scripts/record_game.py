@@ -30,23 +30,11 @@ CORNERS_FILE = Path(__file__).parent.parent / "corners.json"
 MODEL_PATH = Path(__file__).parent.parent / "models" / "chesscam_pieces.onnx"
 
 
-def load_or_select_corners(frame, detector, force_select=False):
+def load_or_select_corners(frame, force_select=False):
     if not force_select and CORNERS_FILE.exists():
         corners = np.array(json.loads(CORNERS_FILE.read_text()), dtype=np.float32)
         print(f"Using saved corners from {CORNERS_FILE}")
         return corners
-
-    # Try auto-detection first
-    if not force_select:
-        print("Auto-detecting board corners from piece positions...")
-        dets = detector.detect_raw(frame)
-        corners = auto_detect_corners(dets)
-        if corners is not None:
-            print(f"  Auto-detected corners: {corners.astype(int).tolist()}")
-            CORNERS_FILE.write_text(json.dumps(corners.tolist()))
-            print(f"  Corners saved to {CORNERS_FILE}")
-            return corners
-        print("  Auto-detection failed. Falling back to manual selection.")
 
     print("Click corners in order: a1, a8, h8, h1")
     corners = select_corners(frame)
@@ -129,8 +117,8 @@ def main():
     print(f"Camera ready: {frame.shape[1]}x{frame.shape[0]}")
 
     if args.auto_corners:
-        # Force auto-detection (ignore saved corners)
-        print("Auto-detecting board corners...")
+        # Experimental: auto-detect from piece positions
+        print("Auto-detecting board corners (experimental)...")
         dets = detector.detect_raw(frame)
         corners = auto_detect_corners(dets)
         if corners is None:
@@ -140,7 +128,7 @@ def main():
             print(f"  Detected corners: {corners.astype(int).tolist()}")
         CORNERS_FILE.write_text(json.dumps(corners.tolist()))
     else:
-        corners = load_or_select_corners(frame, detector, force_select=args.select_corners)
+        corners = load_or_select_corners(frame, force_select=args.select_corners)
     square_centers = compute_square_centers(corners, frame.shape)
     crop_region = compute_crop_region(corners)
     board_quad = compute_board_quad(corners)
