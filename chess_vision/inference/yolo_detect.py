@@ -195,26 +195,38 @@ def compute_board_quad(corners: np.ndarray) -> np.ndarray:
 
 
 def compute_square_centers(corners: np.ndarray, image_shape: tuple) -> np.ndarray:
-    """Compute the 64 square center positions in image space.
+    """Compute the 64 square center positions in image space using perspective transform.
+
+    Uses the inverse homography to map ideal board coordinates to image pixels.
+    This correctly handles perspective distortion (bottom squares appear larger
+    than top squares when viewed at an angle).
 
     Indexed 0=a1, 1=b1, ..., 63=h8.
     """
     from chess_vision.board.warp import order_corners
 
     ordered = order_corners(corners)  # TL, TR, BR, BL
-    tl, tr, br, bl = ordered
+
+    # Compute homography from ideal board (800x800) to image
+    # In ideal board: TL=(0,0), TR=(800,0), BR=(800,800), BL=(0,800)
+    # Rank 8 is at top (y=0), rank 1 is at bottom (y=800)
+    ideal_corners = np.array([
+        [0, 0], [800, 0], [800, 800], [0, 800]
+    ], dtype=np.float32)
+
+    H, _ = cv2.findHomography(ideal_corners, ordered)
 
     centers = np.zeros((64, 2), dtype=np.float32)
     for rank in range(8):
         for file in range(8):
-            u = (file + 0.5) / 8
-            v = (rank + 0.5) / 8  # 0=bottom, 1=top
+            # In ideal board: file 0 (a) = x=50, file 7 (h) = x=750
+            # rank 1 = bottom = y=750, rank 8 = top = y=50
+            ideal_x = (file + 0.5) * 100  # 50, 150, ..., 750
+            ideal_y = (7 - rank + 0.5) * 100  # rank 1 -> y=750, rank 8 -> y=50
 
-            bottom = bl + u * (br - bl)
-            top = tl + u * (tr - tl)
-            center = bottom + v * (top - bottom)
-
-            idx = rank * 8 + file
-            centers[idx] = center
+            # Transform through homography
+            pt = np.array([[[ideal_x, ideal_y]]], dtype=np.float32)
+            transformed = cv2.perspectiveTransform(pt, H)
+            centers[rank * 8 + file] = transformed[0, 0]
 
     return centers
