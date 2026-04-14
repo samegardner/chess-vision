@@ -77,10 +77,14 @@ class YoloPieceDetector:
             x1, y1, x2, y2 = crop_region
             x1, y1 = max(0, int(x1)), max(0, int(y1))
             x2, y2 = min(image.shape[1], int(x2)), min(image.shape[0], int(y2))
+            if x2 <= x1 or y2 <= y1:
+                return []  # Invalid crop region
             image = image[y1:y2, x1:x2]
             offset_x, offset_y = x1, y1
 
         h_orig, w_orig = image.shape[:2]
+        if h_orig == 0 or w_orig == 0:
+            return []
 
         # Letterbox resize (matching ChessCam's preprocessing)
         padded, scale, pad_x, pad_y = letterbox_resize(image, MODEL_WIDTH, MODEL_HEIGHT)
@@ -218,7 +222,19 @@ def compute_square_centers(corners: np.ndarray, image_shape: tuple) -> np.ndarra
         [800, 800],  # h1
     ], dtype=np.float32)
 
-    H, _ = cv2.findHomography(ideal_corners, corners)
+    result = cv2.findHomography(ideal_corners, corners)
+    if result is None or result[0] is None:
+        # Fallback: simple bilinear interpolation
+        centers = np.zeros((64, 2), dtype=np.float32)
+        for rank in range(8):
+            for file in range(8):
+                u = (file + 0.5) / 8
+                v = (rank + 0.5) / 8
+                bottom = a1 + u * (h1 - a1)
+                top = a8 + u * (h8 - a8)
+                centers[rank * 8 + file] = bottom + v * (top - bottom)
+        return centers
+    H = result[0]
 
     centers = np.zeros((64, 2), dtype=np.float32)
     for rank in range(8):

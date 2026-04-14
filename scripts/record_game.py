@@ -239,17 +239,19 @@ def main():
 
             # Periodically re-detect corners (handles board shifting mid-game)
             if xcorner_det and frame_count > 0 and frame_count % RECALIBRATE_INTERVAL == 0:
-                new_corners = auto_detect_corners(
-                    detector.detect_raw(frame), xcorner_det, frame
-                )
-                if new_corners is not None:
-                    shift = np.max(np.abs(new_corners - corners))
-                    if shift > 15:  # Board moved more than 15 pixels
-                        corners = new_corners
-                        square_centers = compute_square_centers(corners, frame.shape)
-                        crop_region = compute_crop_region(corners)
-                        board_quad = compute_board_quad(corners)
-                        pass  # Recalibration is silent
+                try:
+                    new_corners = auto_detect_corners(
+                        detector.detect_raw(frame), xcorner_det, frame
+                    )
+                    if new_corners is not None:
+                        shift = np.max(np.abs(new_corners - corners))
+                        if shift > 15:
+                            corners = new_corners
+                            square_centers = compute_square_centers(corners, frame.shape)
+                            crop_region = compute_crop_region(corners)
+                            board_quad = compute_board_quad(corners)
+                except Exception:
+                    pass  # Recalibration failed, keep current corners
 
             dets = detector.detect_raw(frame, crop_region=crop_region)
             update = detector.detections_to_board(dets, square_centers, board_quad)
