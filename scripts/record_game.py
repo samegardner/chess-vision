@@ -1,15 +1,12 @@
-"""Record a chess game using pixel-based move detection.
+"""Record a chess game using ChessCam's YOLO model + EMA smoothing.
 
-No CNN needed. Uses pixel differencing to detect changed squares,
-then python-chess to find the matching legal move. Accepts partial
-matches (even a single changed square) when only one legal move
-involves that square.
+Uses a pretrained LeYOLO model for piece detection, exponential moving
+average for temporal smoothing, and python-chess legal move scoring.
 
 Usage:
     python scripts/record_game.py
     python scripts/record_game.py --select-corners
     python scripts/record_game.py --output mygame.pgn
-    python scripts/record_game.py --threshold 12
 """
 
 import argparse
@@ -24,11 +21,14 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from chess_vision.board.detect import select_corners
-from chess_vision.board.warp import compute_homography, warp_board
-from chess_vision.game.pixel_moves import PixelMoveDetector
+from chess_vision.board.warp import order_corners
+from chess_vision.inference.yolo_detect import (
+    YoloPieceDetector, compute_square_centers, YOLO_CLASSES, YOLO_TO_FEN,
+)
 from chess_vision.game.pgn import generate_pgn, save_pgn
 
 CORNERS_FILE = Path(__file__).parent.parent / "corners.json"
+MODEL_PATH = Path(__file__).parent.parent / "models" / "chesscam_pieces.onnx"
 
 
 def load_or_select_corners(frame, force_select=False):
@@ -43,115 +43,111 @@ def load_or_select_corners(frame, force_select=False):
     return corners
 
 
-def get_move_squares(move: chess.Move, board: chess.Board) -> set[str]:
-    """Get all squares a move touches (from, to, plus castling/en passant squares)."""
-    squares = {chess.square_name(move.from_square), chess.square_name(move.to_square)}
+def score_move(move: chess.Move, board: chess.Board, state: np.ndarray) -> float:
+    """Score how well the current state matrix matches a move being played.
 
-    if board.is_castling(move):
-        rank = "1" if board.turn == chess.WHITE else "8"
-        if board.is_kingside_castling(move):
-            squares.update({f"h{rank}", f"f{rank}"})
-        else:
-            squares.update({f"a{rank}", f"d{rank}"})
-
-    if board.is_en_passant(move):
-        cap_rank = "5" if board.turn == chess.WHITE else "4"
-        cap_file = chess.square_name(move.to_square)[0]
-        squares.add(f"{cap_file}{cap_rank}")
-
-    return squares
-
-
-def resolve_move(changed_squares: list[str], board: chess.Board) -> chess.Move | None:
-    """Find the legal move that best matches the changed squares.
-
-    Relaxed matching: accepts even a single changed square if only one
-    legal move involves it. Scores candidates by overlap count.
+    Checks: do the 'from' squares look empty? Do the 'to' squares have
+    the expected piece? Higher score = better match.
     """
-    changed_set = set(changed_squares)
-    candidates: list[tuple[chess.Move, int]] = []
+    score = 0.0
+    threshold = 0.3
+
+    # Simulate the move
+    from_sq = move.from_square
+    to_sq = move.to_square
+    piece = board.piece_at(from_sq)
+    if piece is None:
+        return -999
+
+    # From square should now be empty (low occupancy)
+    from_max = float(np.max(state[from_sq]))
+    score += (threshold - from_max)  # Positive if square looks empty
+
+    # To square should have the moved piece
+    piece_sym = piece.symbol()
+    if move.promotion:
+        piece_sym = chess.piece_symbol(move.promotion)
+        if piece.color == chess.WHITE:
+            piece_sym = piece_sym.upper()
+
+    if piece_sym in YOLO_CLASSES:
+        class_idx = YOLO_CLASSES.index(piece_sym)
+        to_score = float(state[to_sq, class_idx])
+        score += (to_score - threshold)
+
+    # Castling: rook should also move
+    if board.is_castling(move):
+        rank = 0 if board.turn == chess.WHITE else 7
+        if board.is_kingside_castling(move):
+            rook_from = chess.square(7, rank)
+            rook_to = chess.square(5, rank)
+        else:
+            rook_from = chess.square(0, rank)
+            rook_to = chess.square(3, rank)
+
+        score += (threshold - float(np.max(state[rook_from])))
+        rook_sym = "R" if board.turn == chess.WHITE else "r"
+        rook_class = YOLO_CLASSES.index(rook_sym)
+        score += (float(state[rook_to, rook_class]) - threshold)
+
+    # En passant: captured pawn should disappear
+    if board.is_en_passant(move):
+        cap_sq = chess.square(chess.square_file(to_sq), chess.square_rank(from_sq))
+        score += (threshold - float(np.max(state[cap_sq])))
+
+    return score
+
+
+def find_best_move(board: chess.Board, state: np.ndarray, min_score: float = 0.1) -> chess.Move | None:
+    """Find the legal move that best matches the current state matrix."""
+    best_move = None
+    best_score = min_score  # Minimum threshold to accept
 
     for move in board.legal_moves:
-        move_squares = get_move_squares(move, board)
-        overlap = len(move_squares & changed_set)
-
-        if overlap > 0:
-            candidates.append((move, overlap))
-
-    if not candidates:
-        return None
-
-    # Sort by overlap (most matching squares first)
-    candidates.sort(key=lambda x: x[1], reverse=True)
-    best_overlap = candidates[0][1]
-
-    # Get all candidates tied for best overlap
-    best_candidates = [m for m, o in candidates if o == best_overlap]
-
-    if len(best_candidates) == 1:
-        return best_candidates[0]
-
-    # Multiple candidates with same overlap. Try to disambiguate:
-    # Prefer moves where the changed squares are exactly the move squares
-    for move in best_candidates:
-        if get_move_squares(move, board) == changed_set:
-            return move
-
-    # Prefer moves with higher overlap ratio (changed covers more of the move)
-    best_ratio = 0
-    best_move = best_candidates[0]
-    for move in best_candidates:
-        ms = get_move_squares(move, board)
-        ratio = len(ms & changed_set) / len(ms)
-        if ratio > best_ratio:
-            best_ratio = ratio
+        s = score_move(move, board, state)
+        if s > best_score:
+            best_score = s
             best_move = move
 
     return best_move
 
 
-def draw_debug(warped, board, changed_squares, detector, last_move_san):
-    """Draw debug overlay."""
-    h, w = warped.shape[:2]
-    sq_h, sq_w = h // 8, w // 8
-    overlay = warped.copy()
-    changed_set = set(changed_squares) if changed_squares else set()
-    candidate_set = detector.candidate_squares or set()
+def draw_debug(frame, detections, square_centers, board, last_move_san, corners):
+    """Draw debug overlay on the camera frame."""
+    overlay = frame.copy()
 
-    for rank in range(8):
-        for file in range(8):
-            row = 7 - rank
-            x1, y1 = file * sq_w, row * sq_h
-            x2, y2 = x1 + sq_w, y1 + sq_h
-            sq_name = chr(ord("a") + file) + str(rank + 1)
-            sq = chess.parse_square(sq_name)
-            piece = board.piece_at(sq)
+    # Draw board outline
+    ordered = order_corners(corners)
+    pts = ordered.astype(int)
+    for i in range(4):
+        cv2.line(overlay, tuple(pts[i]), tuple(pts[(i + 1) % 4]), (0, 255, 0), 2)
 
-            if sq_name in changed_set:
-                cv2.rectangle(overlay, (x1+1, y1+1), (x2-1, y2-1), (0, 255, 0), 3)
-            elif sq_name in candidate_set:
-                cv2.rectangle(overlay, (x1+1, y1+1), (x2-1, y2-1), (0, 255, 255), 2)
-            elif piece:
-                cv2.rectangle(overlay, (x1+1, y1+1), (x2-1, y2-1), (0, 120, 0), 1)
+    # Draw detections as bounding boxes
+    for det in detections:
+        x1 = int(det["cx"] - det["w"] / 2)
+        y1 = int(det["cy"] - det["h"] / 2)
+        x2 = int(det["cx"] + det["w"] / 2)
+        y2 = int(det["cy"] + det["h"] / 2)
+        color = (0, 200, 0) if det["class_name"].isupper() else (200, 0, 0)
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
+        label = f"{det['class_name']} {det['confidence']:.0%}"
+        cv2.putText(overlay, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
 
-            if piece:
-                label = piece.symbol()
-                font = cv2.FONT_HERSHEY_SIMPLEX
-                ts = cv2.getTextSize(label, font, 0.7, 2)[0]
-                tx = x1 + (sq_w - ts[0]) // 2
-                ty = y1 + (sq_h + ts[1]) // 2
-                cv2.putText(overlay, label, (tx, ty), font, 0.7, (0, 0, 0), 3)
-                cv2.putText(overlay, label, (tx, ty), font, 0.7, (255, 255, 255), 2)
+    # Draw square centers
+    for i, center in enumerate(square_centers):
+        sq = chess.square_name(i)
+        piece = board.piece_at(i)
+        if piece:
+            cv2.circle(overlay, tuple(center.astype(int)), 3, (255, 255, 0), -1)
 
+    # Status
     turn = "White" if board.turn == chess.WHITE else "Black"
-    status = f"{turn} to move | Move {board.fullmove_number}"
+    status = f"{turn} | Move {board.fullmove_number}"
     if last_move_san:
         status += f" | Last: {last_move_san}"
-    if detector.hand_present:
-        status += " | HAND"
-    elif candidate_set:
-        status += f" | Watching {sorted(candidate_set)}"
-    cv2.putText(overlay, status, (5, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
+    h = frame.shape[0]
+    cv2.putText(overlay, status, (10, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
     return overlay
 
 
@@ -163,10 +159,18 @@ def main():
     parser.add_argument("--interval", type=float, default=0.3)
     parser.add_argument("--white", type=str, default="White")
     parser.add_argument("--black", type=str, default="Black")
-    parser.add_argument("--threshold", type=float, default=12.0)
-    parser.add_argument("--stability", type=int, default=4)
+    parser.add_argument("--ema", type=float, default=0.5, help="EMA decay (0=no smoothing, 1=infinite memory)")
     parser.add_argument("--no-display", action="store_true")
     args = parser.parse_args()
+
+    if not MODEL_PATH.exists():
+        print(f"Model not found: {MODEL_PATH}")
+        print("Download from: https://drive.google.com/file/d/1-80xp_nly9i6s3o0mF0mU9OZGEzUAlGj")
+        return
+
+    # Load YOLO model
+    print("Loading YOLO piece detector...")
+    detector = YoloPieceDetector(str(MODEL_PATH), ema_decay=args.ema)
 
     # Open camera
     cap = cv2.VideoCapture(args.camera)
@@ -183,23 +187,24 @@ def main():
         return
     print(f"Camera ready: {frame.shape[1]}x{frame.shape[0]}")
 
+    # Get corners
     corners = load_or_select_corners(frame, force_select=args.select_corners)
-    H = compute_homography(corners)
-    warped = warp_board(frame, H)
+    square_centers = compute_square_centers(corners, frame.shape)
 
+    # Quick test: run detection on first frame
+    dets = detector.detect_raw(frame)
+    print(f"Initial detection: {len(dets)} pieces found")
+
+    # Game state
     board = chess.Board()
-    detector = PixelMoveDetector(
-        stability_frames=args.stability,
-        change_threshold=args.threshold,
-    )
-    detector.set_reference(warped)
     move_history: list[chess.Move] = []
     last_move_san = ""
+    frames_since_move = 0
+    MIN_FRAMES_BETWEEN_MOVES = 5  # ~1.5s at 0.3s interval
 
     print()
     print("=== RECORDING ===")
     print(f"Output: {args.output}")
-    print(f"Threshold: {args.threshold}, Stability: {args.stability} frames")
     print("Press Q in window or Ctrl+C to stop.")
     print()
     print(board)
@@ -212,29 +217,35 @@ def main():
             if not ret:
                 continue
 
-            warped = warp_board(frame, H)
-            changed = detector.detect_change(warped)
+            # Detect pieces
+            dets = detector.detect_raw(frame)
+            update = detector.detections_to_board(dets, square_centers)
+            detector.update_state(update)
 
+            frames_since_move += 1
+
+            # Show debug
             if not args.no_display:
-                debug = draw_debug(warped, board, changed, detector, last_move_san)
+                debug = draw_debug(frame, dets, square_centers, board, last_move_san, corners)
                 cv2.imshow("Chess Vision", debug)
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q"):
                     break
 
-            if changed is None:
+            # Don't check for moves too soon after the last one
+            if frames_since_move < MIN_FRAMES_BETWEEN_MOVES:
                 continue
 
-            move = resolve_move(changed, board)
+            # Find best matching legal move
+            move = find_best_move(board, detector.state)
             if move is None:
-                print(f"  ? Changed: {changed}, no legal move matched. Resetting.")
-                detector.set_reference(warped)
                 continue
 
             san = board.san(move)
             board.push(move)
             move_history.append(move)
             last_move_san = san
+            frames_since_move = 0
 
             if board.turn == chess.WHITE:
                 print(f"  {board.fullmove_number - 1}... {san}")

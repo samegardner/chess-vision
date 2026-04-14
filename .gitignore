@@ -16,7 +16,8 @@ data/chesscog/
 data/chessred/
 data/processed/
 data/raw/
-models/*.onnx
+models/occupancy.onnx
+models/piece.onnx
 models/checkpoints/
 
 # IDE
