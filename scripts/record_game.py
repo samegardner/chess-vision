@@ -79,7 +79,7 @@ def main():
     parser.add_argument("--white", type=str, default="White")
     parser.add_argument("--black", type=str, default="Black")
     parser.add_argument("--ema", type=float, default=0.5)
-    parser.add_argument("--greedy-delay", type=float, default=1.5,
+    parser.add_argument("--greedy-delay", type=float, default=3.0,
                         help="Seconds a move must be top candidate before greedy accept")
     parser.add_argument("--no-display", action="store_true")
     args = parser.parse_args()
@@ -130,12 +130,16 @@ def main():
                 cv2.imshow("Chess Vision", debug)
                 cv2.waitKey(1)
 
-    print("Ready!")
+    # Snapshot the starting state so we can detect changes FROM it
+    starting_state = detector.state.copy()
+    print(f"Ready! (EMA stabilized, {np.sum(np.max(starting_state, axis=1) > 0.3)} squares occupied)")
 
     board = chess.Board()
     move_history: list[chess.Move] = []
     last_move_san = ""
-    move_detector = MoveDetectorV2(greedy_delay=args.greedy_delay)
+    # Create detector AFTER warmup so greedy timers start fresh
+    # Pass baseline state so it can reject persistent detection biases
+    move_detector = MoveDetectorV2(greedy_delay=args.greedy_delay, baseline_state=starting_state)
 
     print()
     print("=== RECORDING ===")

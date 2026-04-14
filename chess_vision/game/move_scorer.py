@@ -132,11 +132,28 @@ def calculate_score(state: np.ndarray, move: MoveData, threshold: float = 0.6) -
 class MoveDetectorV2:
     """ChessCam-style move detection with two-move lookahead and greedy fallback."""
 
-    def __init__(self, greedy_delay: float = 1.5):
+    def __init__(self, greedy_delay: float = 3.0, baseline_state: np.ndarray | None = None):
         self.possible_moves: set[str] = set()
         self.greedy_times: dict[str, float] = {}
         self.greedy_delay = greedy_delay
         self.last_move_san: str = ""
+        self.baseline_state = baseline_state  # EMA state from warmup (starting position)
+
+    def _state_changed_enough(self, state: np.ndarray, move: MoveData) -> bool:
+        """Check that the from/to squares actually changed from the baseline.
+
+        Rejects moves where the model had the same bias during warmup
+        (e.g., consistently thinks h2 is empty even in starting position).
+        """
+        if self.baseline_state is None:
+            return True
+
+        min_change = 0.15  # Minimum EMA change from baseline to count
+        for sq in move.from_squares:
+            delta = float(np.max(self.baseline_state[sq])) - float(np.max(state[sq]))
+            if delta < min_change:
+                return False  # This square didn't change from baseline
+        return True
 
     def detect_move(self, board: chess.Board, state: np.ndarray) -> str | None:
         """Check if a move should be played based on the current state matrix.
@@ -156,6 +173,9 @@ class MoveDetectorV2:
             # Score move1 (deduplicated)
             if pair.move1.san not in seen:
                 seen.add(pair.move1.san)
+                # Skip moves where from-squares haven't changed from baseline
+                if not self._state_changed_enough(state, pair.move1):
+                    continue
                 score1 = calculate_score(state, pair.move1)
                 if score1 > 0:
                     self.possible_moves.add(pair.move1.san)
