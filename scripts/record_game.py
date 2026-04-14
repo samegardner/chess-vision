@@ -178,7 +178,7 @@ def main():
     frame_count = 0
     greedy_pending = False
     UNDO_CHECK_FRAMES = 10
-    RECALIBRATE_INTERVAL = 100  # Re-detect corners every ~5s at 20 FPS
+    RECALIBRATE_INTERVAL = 20  # Re-detect corners every ~1s at 20 FPS
 
     # Load xcorner detector for periodic recalibration
     xcorner_det = None
