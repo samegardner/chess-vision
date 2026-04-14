@@ -177,7 +177,13 @@ def main():
     frames_since_last_move = 0
     frame_count = 0
     greedy_pending = False
-    UNDO_CHECK_FRAMES = 10  # ~0.5s at 20 FPS, check if greedy move was correct
+    UNDO_CHECK_FRAMES = 10
+    RECALIBRATE_INTERVAL = 100  # Re-detect corners every ~5s at 20 FPS
+
+    # Load xcorner detector for periodic recalibration
+    xcorner_det = None
+    if XCORNERS_MODEL_PATH.exists():
+        xcorner_det = XCornerDetector(str(XCORNERS_MODEL_PATH))
 
     try:
         while not board.is_game_over():
@@ -186,6 +192,20 @@ def main():
             ret, frame = cap.read()
             if not ret:
                 continue
+
+            # Periodically re-detect corners (handles board shifting mid-game)
+            if xcorner_det and frame_count > 0 and frame_count % RECALIBRATE_INTERVAL == 0:
+                new_corners = auto_detect_corners(
+                    detector.detect_raw(frame), xcorner_det, frame
+                )
+                if new_corners is not None:
+                    shift = np.max(np.abs(new_corners - corners))
+                    if shift > 15:  # Board moved more than 15 pixels
+                        corners = new_corners
+                        square_centers = compute_square_centers(corners, frame.shape)
+                        crop_region = compute_crop_region(corners)
+                        board_quad = compute_board_quad(corners)
+                        print(f"  (board shifted, recalibrated)")
 
             dets = detector.detect_raw(frame, crop_region=crop_region)
             update = detector.detections_to_board(dets, square_centers, board_quad)
