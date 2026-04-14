@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from chess_vision.board.detect import select_corners
 from chess_vision.board.warp import order_corners
 from chess_vision.inference.yolo_detect import (
-    YoloPieceDetector, compute_square_centers, YOLO_CLASSES,
+    YoloPieceDetector, compute_square_centers, compute_crop_region, YOLO_CLASSES,
 )
 from chess_vision.game.move_scorer import MoveDetectorV2
 from chess_vision.game.pgn import generate_pgn, save_pgn
@@ -107,6 +107,13 @@ def main():
 
     corners = load_or_select_corners(frame, force_select=args.select_corners)
     square_centers = compute_square_centers(corners, frame.shape)
+    crop_region = compute_crop_region(corners)
+    print(f"Board crop region: {crop_region}")
+
+    # Test detection with cropping
+    dets_full = detector.detect_raw(frame)
+    dets_crop = detector.detect_raw(frame, crop_region=crop_region)
+    print(f"Detections without crop: {len(dets_full)}, with crop: {len(dets_crop)}")
 
     # Warmup: let EMA stabilize
     WARMUP_FRAMES = 15
@@ -115,7 +122,7 @@ def main():
         time.sleep(args.interval)
         ret, frame = cap.read()
         if ret:
-            dets = detector.detect_raw(frame)
+            dets = detector.detect_raw(frame, crop_region=crop_region)
             update = detector.detections_to_board(dets, square_centers)
             detector.update_state(update)
             if not args.no_display:
@@ -145,7 +152,7 @@ def main():
             if not ret:
                 continue
 
-            dets = detector.detect_raw(frame)
+            dets = detector.detect_raw(frame, crop_region=crop_region)
             update = detector.detections_to_board(dets, square_centers)
             detector.update_state(update)
 

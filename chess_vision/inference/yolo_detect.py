@@ -34,12 +34,26 @@ class YoloPieceDetector:
         self.state = np.zeros((64, 12), dtype=np.float32)
         self.initialized = False
 
-    def detect_raw(self, image: np.ndarray) -> list[dict]:
+    def detect_raw(self, image: np.ndarray, crop_region: tuple | None = None) -> list[dict]:
         """Run YOLO on an image, return raw detections.
+
+        Args:
+            image: Full camera frame (BGR).
+            crop_region: Optional (x1, y1, x2, y2) to crop before detection.
+                         Coordinates returned are mapped back to full image space.
 
         Returns list of dicts with keys: cx, cy, w, h, class_id, class_name, confidence
         All coordinates are in original image pixel space.
         """
+        # Crop to board region if provided (makes pieces larger in the input)
+        offset_x, offset_y = 0, 0
+        if crop_region is not None:
+            x1, y1, x2, y2 = crop_region
+            x1, y1 = max(0, int(x1)), max(0, int(y1))
+            x2, y2 = min(image.shape[1], int(x2)), min(image.shape[0], int(y2))
+            image = image[y1:y2, x1:x2]
+            offset_x, offset_y = x1, y1
+
         h_orig, w_orig = image.shape[:2]
 
         # Preprocess: resize to model input, normalize to 0-1, CHW format
@@ -92,8 +106,8 @@ class YoloPieceDetector:
         detections = []
         for idx in indices.flatten():
             detections.append({
-                "cx": boxes[idx][0],
-                "cy": boxes[idx][1],
+                "cx": boxes[idx][0] + offset_x,
+                "cy": boxes[idx][1] + offset_y,
                 "w": boxes[idx][2],
                 "h": boxes[idx][3],
                 "class_id": class_ids[idx],
@@ -164,6 +178,27 @@ class YoloPieceDetector:
                 board_state[sq_name] = None
 
         return board_state
+
+
+def compute_crop_region(corners: np.ndarray, padding: float = 0.15) -> tuple[int, int, int, int]:
+    """Compute a bounding box around the board corners with padding.
+
+    Returns (x1, y1, x2, y2) crop region.
+    """
+    from chess_vision.board.warp import order_corners
+    ordered = order_corners(corners)
+    xs = ordered[:, 0]
+    ys = ordered[:, 1]
+    x1, x2 = float(xs.min()), float(xs.max())
+    y1, y2 = float(ys.min()), float(ys.max())
+    w = x2 - x1
+    h = y2 - y1
+    # Add padding (pieces extend above the board edge)
+    x1 -= w * padding
+    y1 -= h * padding * 2  # More padding on top (pieces are tall)
+    x2 += w * padding
+    y2 += h * padding
+    return (int(x1), int(y1), int(x2), int(y2))
 
 
 def compute_square_centers(corners: np.ndarray, image_shape: tuple) -> np.ndarray:
