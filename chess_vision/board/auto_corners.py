@@ -153,13 +153,15 @@ def auto_detect_corners(
     white_centroid = np.mean([[d["cx"], d["cy"]] for d in white_pieces], axis=0)
     black_centroid = np.mean([[d["cx"], d["cy"]] for d in black_pieces], axis=0)
 
-    # Try all 4 rotations: [a1, a8, h8, h1]
-    # a1/h1 edge should be near white, a8/h8 edge near black
+    # Try all 4 edge assignments: [a1, a8, h8, h1]
+    # a1 and h1 must be on the SAME edge (white's back rank)
+    # a8 and h8 must be on the OPPOSITE edge (black's back rank)
+    # The 4 options correspond to which edge is white's:
     rotations = [
-        [bl, tl, tr, br],
-        [br, bl, tl, tr],
-        [tr, br, bl, tl],
-        [tl, tr, br, bl],
+        [bl, tl, tr, br],  # Bottom edge = white (a1=BL, h1=BR)
+        [tl, tr, br, bl],  # Left edge = white  (a1=TL, h1=BL)
+        [tr, br, bl, tl],  # Top edge = white   (a1=TR, h1=TL)
+        [br, bl, tl, tr],  # Right edge = white (a1=BR, h1=TR)
     ]
 
     best_rotation = None
