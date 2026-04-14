@@ -98,7 +98,7 @@ def score_move(move: chess.Move, board: chess.Board, state: np.ndarray) -> float
     return score
 
 
-def find_best_move(board: chess.Board, state: np.ndarray, min_score: float = 0.1) -> chess.Move | None:
+def find_best_move(board: chess.Board, state: np.ndarray, min_score: float = 0.25) -> chess.Move | None:
     """Find the legal move that best matches the current state matrix."""
     best_move = None
     best_score = min_score  # Minimum threshold to accept
@@ -195,12 +195,30 @@ def main():
     dets = detector.detect_raw(frame)
     print(f"Initial detection: {len(dets)} pieces found")
 
+    # Warmup: let EMA stabilize on starting position before accepting moves
+    WARMUP_FRAMES = 20  # ~6 seconds at 0.3s interval
+    print(f"Stabilizing ({WARMUP_FRAMES * args.interval:.0f}s warmup)...")
+    for i in range(WARMUP_FRAMES):
+        time.sleep(args.interval)
+        ret, frame = cap.read()
+        if ret:
+            dets = detector.detect_raw(frame)
+            update = detector.detections_to_board(dets, square_centers)
+            detector.update_state(update)
+            if not args.no_display:
+                debug = draw_debug(frame, dets, square_centers, chess.Board(), "", corners)
+                cv2.imshow("Chess Vision", debug)
+                cv2.waitKey(1)
+        if (i + 1) % 5 == 0:
+            print(f"  {i + 1}/{WARMUP_FRAMES} frames...")
+    print("Ready!")
+
     # Game state
     board = chess.Board()
     move_history: list[chess.Move] = []
     last_move_san = ""
     frames_since_move = 0
-    MIN_FRAMES_BETWEEN_MOVES = 5  # ~1.5s at 0.3s interval
+    MIN_FRAMES_BETWEEN_MOVES = 8  # ~2.4s at 0.3s interval
 
     print()
     print("=== RECORDING ===")
