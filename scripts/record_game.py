@@ -18,6 +18,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from chess_vision.board.detect import select_corners
+from chess_vision.board.auto_corners import auto_detect_corners
 from chess_vision.inference.yolo_detect import (
     YoloPieceDetector, compute_square_centers, compute_crop_region,
     compute_board_quad,
@@ -29,12 +30,25 @@ CORNERS_FILE = Path(__file__).parent.parent / "corners.json"
 MODEL_PATH = Path(__file__).parent.parent / "models" / "chesscam_pieces.onnx"
 
 
-def load_or_select_corners(frame, force_select=False):
+def load_or_select_corners(frame, detector, force_select=False):
     if not force_select and CORNERS_FILE.exists():
         corners = np.array(json.loads(CORNERS_FILE.read_text()), dtype=np.float32)
         print(f"Using saved corners from {CORNERS_FILE}")
         return corners
-    print("Click the 4 corners of the chessboard...")
+
+    # Try auto-detection first
+    if not force_select:
+        print("Auto-detecting board corners from piece positions...")
+        dets = detector.detect_raw(frame)
+        corners = auto_detect_corners(dets)
+        if corners is not None:
+            print(f"  Auto-detected corners: {corners.astype(int).tolist()}")
+            CORNERS_FILE.write_text(json.dumps(corners.tolist()))
+            print(f"  Corners saved to {CORNERS_FILE}")
+            return corners
+        print("  Auto-detection failed. Falling back to manual selection.")
+
+    print("Click corners in order: a1, a8, h8, h1")
     corners = select_corners(frame)
     CORNERS_FILE.write_text(json.dumps(corners.tolist()))
     print(f"Corners saved to {CORNERS_FILE}")
@@ -83,7 +97,8 @@ def main():
     parser = argparse.ArgumentParser(description="Record a chess game")
     parser.add_argument("--camera", type=int, default=0)
     parser.add_argument("--output", type=str, default="game.pgn")
-    parser.add_argument("--select-corners", action="store_true")
+    parser.add_argument("--select-corners", action="store_true", help="Manually click corners")
+    parser.add_argument("--auto-corners", action="store_true", help="Auto-detect corners from piece positions")
     parser.add_argument("--interval", type=float, default=0.05)
     parser.add_argument("--white", type=str, default="White")
     parser.add_argument("--black", type=str, default="Black")
@@ -113,7 +128,19 @@ def main():
         return
     print(f"Camera ready: {frame.shape[1]}x{frame.shape[0]}")
 
-    corners = load_or_select_corners(frame, force_select=args.select_corners)
+    if args.auto_corners:
+        # Force auto-detection (ignore saved corners)
+        print("Auto-detecting board corners...")
+        dets = detector.detect_raw(frame)
+        corners = auto_detect_corners(dets)
+        if corners is None:
+            print("  Auto-detection failed. Falling back to manual.")
+            corners = select_corners(frame)
+        else:
+            print(f"  Detected corners: {corners.astype(int).tolist()}")
+        CORNERS_FILE.write_text(json.dumps(corners.tolist()))
+    else:
+        corners = load_or_select_corners(frame, detector, force_select=args.select_corners)
     square_centers = compute_square_centers(corners, frame.shape)
     crop_region = compute_crop_region(corners)
     board_quad = compute_board_quad(corners)
