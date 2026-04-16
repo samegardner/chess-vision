@@ -125,6 +125,33 @@ def draw_debug(frame, detections, square_centers, board, san_history, corners,
     return combined
 
 
+def debug_anchor_mapping(detections, square_centers, board_quad):
+    """Print rook detections: anchor pixel, assigned square, and offset.
+
+    Compares the ChessCam anchor (cx, cy + h/2 - w/3) against the assigned
+    square center to spot systematic offsets.
+    """
+    from chess_vision.inference.yolo_detect import point_in_quad
+    rooks = [d for d in detections if d["class_name"].lower() == "r"]
+    if not rooks:
+        print("[debug] no rooks detected this frame")
+        return
+
+    print(f"[debug] {len(rooks)} rook detection(s):")
+    print(f"  {'cls':>4} {'conf':>5}  {'anchor (x,y)':>16}  {'sq':>4}  {'sq_center':>14}  {'dx,dy':>10}  in_quad")
+    for d in rooks:
+        ax = d["cx"]
+        ay = d["cy"] + d["h"] / 2 - d["w"] / 3
+        in_quad = point_in_quad(np.array([ax, ay]), board_quad) if board_quad is not None else True
+        dists = np.sqrt((square_centers[:, 0] - ax) ** 2 + (square_centers[:, 1] - ay) ** 2)
+        sq = int(np.argmin(dists))
+        scx, scy = square_centers[sq]
+        sq_name = chess.square_name(sq)
+        print(f"  {d['class_name']:>4} {d['confidence']:>5.0%}  "
+              f"({ax:6.0f},{ay:6.0f})  {sq_name:>4}  "
+              f"({scx:6.0f},{scy:6.0f})  ({ax-scx:+4.0f},{ay-scy:+4.0f})  {in_quad}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Record a chess game")
     parser.add_argument("--camera", type=int, default=0)
@@ -137,6 +164,8 @@ def main():
     parser.add_argument("--ema", type=float, default=0.4)
     parser.add_argument("--greedy-delay", type=float, default=1.0)
     parser.add_argument("--no-display", action="store_true")
+    parser.add_argument("--debug-anchors", action="store_true",
+                        help="Print rook anchor->square mappings every ~1.5s")
     args = parser.parse_args()
 
     if not MODEL_PATH.exists():
@@ -271,6 +300,9 @@ def _run_recording(args, caffeinate_proc):
 
             dets = detector.detect_raw(frame, crop_region=crop_region)
             update = detector.detections_to_board(dets, square_centers, board_quad)
+
+            if args.debug_anchors and frame_count % 30 == 0:
+                debug_anchor_mapping(dets, square_centers, board_quad)
 
             # Hand detection: if piece count drops significantly, freeze state
             expected_pieces = len([sq for sq in chess.SQUARES if board.piece_at(sq)])
