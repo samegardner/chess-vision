@@ -76,8 +76,15 @@ def test_combine_data_removes_overlaps():
     assert len(set(combined.from_squares)) == len(combined.from_squares)  # No duplicates
 
 
-def test_greedy_delay():
-    """Greedy fallback should not fire before the delay."""
+def test_greedy_delay(monkeypatch):
+    """Greedy fallback must not fire before greedy_delay elapses, and MUST
+    fire once it does. Monkey-patching time.time keeps the test deterministic
+    instead of relying on real wall-clock sleeps.
+    """
+    import time as time_module
+    fake_now = [1000.0]
+    monkeypatch.setattr(time_module, "time", lambda: fake_now[0])
+
     detector = MoveDetectorV2(greedy_delay=1.0)
     state = _make_state_with_starting_position()
     board = chess.Board()
@@ -86,9 +93,16 @@ def test_greedy_delay():
     state[chess.E2] = np.zeros(12)
     state[chess.E4, LABEL_MAP["P"]] = 0.8
 
-    # First call: should not fire (timer just started)
-    result = detector.detect_move(board, state)
-    assert result is None
+    # First call starts the timer, must not fire yet.
+    assert detector.detect_move(board, state) is None
+
+    # Half the delay -> still nothing.
+    fake_now[0] += 0.5
+    assert detector.detect_move(board, state) is None
+
+    # Past the delay -> the move fires.
+    fake_now[0] += 1.0
+    assert detector.detect_move(board, state) == "e4"
 
 
 def test_pgn_generation():
@@ -99,3 +113,27 @@ def test_pgn_generation():
     assert "e4" in pgn
     assert "e5" in pgn
     assert "W" in pgn
+
+
+def test_cache_invalidates_on_ep_rights_change():
+    """Same piece placement + same turn but different EP rights must rebuild
+    the move pair cache. board_fen() drops EP, so the cache key has to use
+    the full fen() to avoid stale 'exd6' SANs surviving into a position
+    where they're no longer legal.
+    """
+    detector = MoveDetectorV2()
+    state = np.zeros((64, 12), dtype=np.float32)
+
+    # White can play exd6 en passant
+    ep_board = chess.Board("rnbqkbnr/ppp1pppp/8/3pP3/8/8/PPPP1PPP/RNBQKBNR w KQkq d6 0 3")
+    detector.detect_move(ep_board, state)
+    legal_with_ep = {p.move1.san for p in detector._cached_pairs}
+    assert "exd6" in legal_with_ep
+
+    # Same piece placement but EP no longer legal (new arrival path).
+    # board_fen() is identical, but fen() differs -> cache must rebuild.
+    no_ep_board = chess.Board("rnbqkbnr/ppp1pppp/8/3pP3/8/8/PPPP1PPP/RNBQKBNR w KQkq - 0 3")
+    assert ep_board.board_fen() == no_ep_board.board_fen()
+    detector.detect_move(no_ep_board, state)
+    legal_without_ep = {p.move1.san for p in detector._cached_pairs}
+    assert "exd6" not in legal_without_ep

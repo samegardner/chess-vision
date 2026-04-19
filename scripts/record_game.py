@@ -24,12 +24,45 @@ from chess_vision.inference.yolo_detect import (
     YoloPieceDetector, compute_square_centers, compute_crop_region,
     compute_board_quad,
 )
-from chess_vision.game.move_scorer import MoveDetectorV2
+from chess_vision.game.move_scorer import MoveDetectorV2, MoveData, get_move_data
 from chess_vision.game.pgn import generate_pgn, save_pgn
 
 CORNERS_FILE = Path(__file__).parent.parent / "corners.json"
 MODEL_PATH = Path(__file__).parent.parent / "models" / "chesscam_pieces.onnx"
 XCORNERS_MODEL_PATH = Path(__file__).parent.parent / "models" / "chesscam_xcorners.onnx"
+
+
+def align_to_existing(new_corners: np.ndarray, old_corners: np.ndarray) -> np.ndarray:
+    """Find the cyclic rotation of new_corners that best matches old_corners.
+
+    Mid-game recalibration must NOT re-derive orientation from piece positions:
+    after several moves, Q/K and centroids no longer disambiguate sides
+    reliably, so auto_detect_corners can return a flipped board. This locks
+    the new corners to the existing a1/a8/h8/h1 assignment by picking the
+    rotation with the smallest max corner displacement.
+    """
+    best = new_corners
+    best_shift = float("inf")
+    for k in range(4):
+        rotated = np.roll(new_corners, -k, axis=0)
+        shift = float(np.max(np.linalg.norm(rotated - old_corners, axis=1)))
+        if shift < best_shift:
+            best_shift = shift
+            best = rotated
+    return best
+
+
+def read_fresh(cap, drain: int = 4):
+    """Read the latest frame, dropping any stale buffered ones first.
+
+    Internal capture buffers can hold ~5 frames; without draining, cap.read()
+    returns the OLDEST one, so EMA learns from a frame ~250ms in the past.
+    grab() decodes nothing, so draining is cheap.
+    """
+    for _ in range(drain):
+        if not cap.grab():
+            return False, None
+    return cap.retrieve()
 
 
 def load_or_select_corners(frame, force_select=False):
@@ -43,6 +76,24 @@ def load_or_select_corners(frame, force_select=False):
     CORNERS_FILE.write_text(json.dumps(corners.tolist()))
     print(f"Corners saved to {CORNERS_FILE}")
     return corners
+
+
+def _game_over_text(board: chess.Board) -> str | None:
+    """Return a short label for the game-over reason, or None if still playing."""
+    if not board.is_game_over():
+        return None
+    if board.is_checkmate():
+        winner = "Black" if board.turn == chess.WHITE else "White"
+        return f"CHECKMATE - {winner} wins"
+    if board.is_stalemate():
+        return "STALEMATE"
+    if board.is_insufficient_material():
+        return "DRAW - insufficient material"
+    if board.is_seventyfive_moves():
+        return "DRAW - 75-move rule"
+    if board.is_fivefold_repetition():
+        return "DRAW - fivefold repetition"
+    return "GAME OVER"
 
 
 def draw_debug(frame, detections, square_centers, board, san_history, corners,
@@ -90,7 +141,10 @@ def draw_debug(frame, detections, square_centers, board, san_history, corners,
     cv2.putText(panel, f"Move {board.fullmove_number} | {turn}", (15, 85),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
 
-    if hand_on_board:
+    over_text = _game_over_text(board)
+    if over_text:
+        cv2.putText(panel, over_text, (15, 125), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+    elif hand_on_board:
         cv2.putText(panel, "HAND DETECTED", (15, 125), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
     # Move list
@@ -194,6 +248,11 @@ def _run_recording(args, caffeinate_proc):
         print(f"Could not open camera {args.camera}")
         return
 
+    # Minimize internal buffering so cap.read() returns the freshest frame.
+    # On macOS AVFoundation this is often a no-op, hence the buffer-drain
+    # in read_fresh() below.
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
     print("Warming up camera...")
     for _ in range(30):
         cap.read()
@@ -237,7 +296,7 @@ def _run_recording(args, caffeinate_proc):
     print("Stabilizing (~1.5s)...")
     for _ in range(WARMUP_FRAMES):
         time.sleep(args.interval)
-        ret, frame = cap.read()
+        ret, frame = read_fresh(cap)
         if ret:
             dets = detector.detect_raw(frame, crop_region=crop_region)
             update = detector.detections_to_board(dets, square_centers, board_quad)
@@ -250,6 +309,7 @@ def _run_recording(args, caffeinate_proc):
     board = chess.Board()
     move_history: list[chess.Move] = []
     san_history: list[str] = []  # Cached SAN strings (avoids replaying game each frame)
+    move_data_history: list[MoveData] = []  # Per-move from/to squares + targets, for undo
     move_detector = MoveDetectorV2(greedy_delay=args.greedy_delay)
 
     print()
@@ -265,6 +325,8 @@ def _run_recording(args, caffeinate_proc):
     greedy_pending = False
     UNDO_CHECK_FRAMES = 10
     RECALIBRATE_INTERVAL = 200  # Re-detect corners every ~10s at 20 FPS
+    HAND_TRIGGER_FRAMES = 2     # Consecutive low-count frames before freezing
+    hand_low_streak = 0
 
     # Load xcorner detector for periodic recalibration
     xcorner_det = None
@@ -272,31 +334,44 @@ def _run_recording(args, caffeinate_proc):
         xcorner_det = XCornerDetector(str(XCORNERS_MODEL_PATH))
 
     try:
-        while not board.is_game_over():
+        # Loop runs until user hits Q. After is_game_over() we keep rendering
+        # the final position with the GAME OVER overlay so the user can read
+        # the result, and we stop pushing moves.
+        while True:
             loop_start = time.monotonic()
 
-            ret, frame = cap.read()
+            ret, frame = read_fresh(cap)
             if not ret:
                 continue
 
-            # Periodically re-detect corners (handles board shifting mid-game)
-            if xcorner_det and frame_count > 0 and frame_count % RECALIBRATE_INTERVAL == 0:
+            game_over = board.is_game_over()
+
+            # Periodically re-detect corners (handles board shifting mid-game).
+            # Mid-game we lock the new corners to the existing orientation
+            # (a1/a8/h8/h1 mapping) and only accept SMALL shifts. Large shifts
+            # almost always mean auto_detect_corners got confused (e.g. flipped
+            # the board) once the position is no longer the starting one.
+            if not game_over and xcorner_det and frame_count > 0 and frame_count % RECALIBRATE_INTERVAL == 0:
                 try:
-                    # Use full frame (no crop) so piece colors are detected for orientation
                     full_dets = detector.detect_raw(frame)
                     new_corners = auto_detect_corners(full_dets, xcorner_det, frame)
                     if new_corners is not None:
-                        shift = np.max(np.abs(new_corners - corners))
-                        if shift > 15:
-                            corners = new_corners
+                        aligned = align_to_existing(new_corners, corners)
+                        per_corner_shift = np.linalg.norm(aligned - corners, axis=1)
+                        max_shift = float(np.max(per_corner_shift))
+                        # Accept tiny adjustments only. Reject anything that
+                        # smells like an orientation swap or a detection blunder.
+                        if 15 < max_shift < 80:
+                            corners = aligned
                             square_centers = compute_square_centers(corners, frame.shape)
                             crop_region = compute_crop_region(corners)
                             board_quad = compute_board_quad(corners)
-                            # Reset EMA so it re-learns with new orientation
+                            # EMA was learned on the OLD square grid; reset so
+                            # square assignments re-learn from fresh detections.
                             detector.state = np.zeros((64, 12), dtype=np.float32)
                             detector.initialized = False
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"[recalibrate] skipped: {e}")
 
             dets = detector.detect_raw(frame, crop_region=crop_region)
             update = detector.detections_to_board(dets, square_centers, board_quad)
@@ -304,10 +379,17 @@ def _run_recording(args, caffeinate_proc):
             if args.debug_anchors and frame_count % 30 == 0:
                 debug_anchor_mapping(dets, square_centers, board_quad)
 
-            # Hand detection: if piece count drops significantly, freeze state
+            # Hand detection: freeze state when piece count drops sustainedly.
+            # Single-frame dips (one bad detection) shouldn't trigger; otherwise
+            # noise freezes tracking and good moves get missed. Requires
+            # HAND_TRIGGER_FRAMES consecutive low frames before declaring a hand.
             expected_pieces = len([sq for sq in chess.SQUARES if board.piece_at(sq)])
             detected_pieces = int(np.sum(np.max(update, axis=1) > 0.3))
-            hand_on_board = detected_pieces < expected_pieces * 0.7
+            if detected_pieces < expected_pieces * 0.7:
+                hand_low_streak += 1
+            else:
+                hand_low_streak = 0
+            hand_on_board = hand_low_streak >= HAND_TRIGGER_FRAMES
 
             if not hand_on_board:
                 detector.update_state(update)
@@ -329,30 +411,43 @@ def _run_recording(args, caffeinate_proc):
                 board = chess.Board()
                 move_history.clear()
                 san_history.clear()
+                move_data_history.clear()
                 greedy_pending = False
+                frames_since_last_move = 0
+                hand_low_streak = 0
                 move_detector = MoveDetectorV2(greedy_delay=args.greedy_delay)
                 # Re-snapshot the current board as the new reference
                 detector.state = np.zeros((64, 12), dtype=np.float32)
                 detector.initialized = False
 
+            # No more move detection once the game has ended.
+            if game_over:
+                continue
+
             # Don't check for moves while hand is on board
             if hand_on_board:
                 continue
 
-            # Auto-undo: if last move was greedy and looks wrong, retract it
+            # Auto-undo: if last move was greedy and looks wrong, retract it.
+            # Uses full MoveData so castling (rook squares) and en passant
+            # (captured pawn square) are checked too, not just king/pawn travel.
             if (greedy_pending and frames_since_last_move >= UNDO_CHECK_FRAMES):
-                last_move = move_history[-1]
-                from_sq = last_move.from_square
-                to_sq = last_move.to_square
-                from_occ = float(np.max(detector.state[from_sq]))
-                to_occ = float(np.max(detector.state[to_sq]))
-                # If from-square still looks occupied OR to-square looks empty, undo
+                last_data = move_data_history[-1]
+                # Any of the from-squares still looking occupied -> undo
+                from_occ = max(
+                    float(np.max(detector.state[sq])) for sq in last_data.from_squares
+                )
+                # Any to-square not showing the expected piece -> undo
+                to_occ = min(
+                    float(detector.state[sq, last_data.targets[i]])
+                    for i, sq in enumerate(last_data.to_squares)
+                )
                 if from_occ > 0.4 or to_occ < 0.2:
                     board.pop()
                     move_history.pop()
                     san_history.pop()
+                    move_data_history.pop()
                     greedy_pending = False
-                    # Undo shown in display window via move_history update
                     continue
                 else:
                     # Move confirmed, no longer pending
@@ -362,10 +457,19 @@ def _run_recording(args, caffeinate_proc):
             if san is None:
                 continue
 
-            move = board.parse_san(san)
+            # Defensive: detector should only return legal SANs, but if cache
+            # ever desyncs we'd rather skip the frame than crash the recording.
+            try:
+                move = board.parse_san(san)
+            except (chess.IllegalMoveError, chess.InvalidMoveError, chess.AmbiguousMoveError) as e:
+                print(f"[detect] dropping illegal SAN '{san}': {e}")
+                continue
+
+            move_data = get_move_data(board, move)  # capture before push
             board.push(move)
             move_history.append(move)
             san_history.append(san)
+            move_data_history.append(move_data)
             frames_since_last_move = 0
             greedy_pending = True  # All moves start as tentative
 

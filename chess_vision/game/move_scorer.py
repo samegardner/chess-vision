@@ -140,8 +140,10 @@ class MoveDetectorV2:
     def detect_move(self, board: chess.Board, state: np.ndarray) -> str | None:
         now = time.time()
 
-        # Cache move pairs (only recompute when position changes)
-        fen = board.board_fen() + str(board.turn)
+        # Cache move pairs (only recompute when position changes).
+        # Use full FEN: board_fen alone misses en passant + castling rights,
+        # which can leave stale SANs in the cache that aren't legal anymore.
+        fen = board.fen()
         if fen != self._cached_fen:
             self._cached_pairs = get_move_pairs(board)
             self._cached_fen = fen
