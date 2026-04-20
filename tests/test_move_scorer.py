@@ -5,6 +5,7 @@ import numpy as np
 
 from chess_vision.game.move_scorer import (
     calculate_score, get_move_data, get_move_pairs, combine_data,
+    should_undo,
     MoveDetectorV2, LABELS, LABEL_MAP,
 )
 
@@ -113,6 +114,62 @@ def test_pgn_generation():
     assert "e4" in pgn
     assert "e5" in pgn
     assert "W" in pgn
+
+
+def test_should_undo_castling_kept_when_state_matches():
+    """After O-O, state should show king on g1, rook on f1, e1 and h1 empty.
+    should_undo must NOT fire (castling was real)."""
+    board = chess.Board("rnbqk2r/pppp1ppp/5n2/4p3/4P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4")
+    move = board.parse_san("O-O")
+    data = get_move_data(board, move)
+
+    state = np.zeros((64, 12), dtype=np.float32)
+    state[chess.G1, LABEL_MAP["K"]] = 0.85
+    state[chess.F1, LABEL_MAP["R"]] = 0.85
+
+    assert should_undo(state, data) is False
+
+
+def test_should_undo_castling_fires_when_rook_stuck():
+    """If after O-O the rook detection is still on h1 (didn't actually move),
+    should_undo must catch it - a naive king-only check would miss this."""
+    board = chess.Board("rnbqk2r/pppp1ppp/5n2/4p3/4P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4")
+    move = board.parse_san("O-O")
+    data = get_move_data(board, move)
+
+    state = np.zeros((64, 12), dtype=np.float32)
+    state[chess.G1, LABEL_MAP["K"]] = 0.85  # king landed correctly
+    state[chess.H1, LABEL_MAP["R"]] = 0.85  # rook never left -> should undo
+    # f1 intentionally left empty (to-square with no piece)
+
+    assert should_undo(state, data) is True
+
+
+def test_should_undo_en_passant_kept_when_captured_pawn_gone():
+    """After exd6 e.p., d5 (captured pawn) must be empty. should_undo
+    should NOT fire when state reflects that."""
+    board = chess.Board("rnbqkbnr/ppp1pppp/8/3pP3/8/8/PPPP1PPP/RNBQKBNR w KQkq d6 0 3")
+    move = board.parse_san("exd6")
+    data = get_move_data(board, move)
+
+    state = np.zeros((64, 12), dtype=np.float32)
+    state[chess.D6, LABEL_MAP["P"]] = 0.85  # capturing pawn landed
+
+    assert should_undo(state, data) is False
+
+
+def test_should_undo_en_passant_fires_when_captured_pawn_still_there():
+    """If after exd6 e.p. the black pawn on d5 is still detected, the
+    captured-pawn square entry in from_squares catches it and undo fires."""
+    board = chess.Board("rnbqkbnr/ppp1pppp/8/3pP3/8/8/PPPP1PPP/RNBQKBNR w KQkq d6 0 3")
+    move = board.parse_san("exd6")
+    data = get_move_data(board, move)
+
+    state = np.zeros((64, 12), dtype=np.float32)
+    state[chess.D6, LABEL_MAP["P"]] = 0.85  # capturing pawn landed
+    state[chess.D5, LABEL_MAP["p"]] = 0.85  # captured pawn still visible -> undo
+
+    assert should_undo(state, data) is True
 
 
 def test_castling_collision_does_not_block_opposite_color(monkeypatch):

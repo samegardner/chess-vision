@@ -25,7 +25,7 @@ from chess_vision.inference.yolo_detect import (
     compute_board_quad,
 )
 from chess_vision.event_log import EventLog
-from chess_vision.game.move_scorer import MoveDetectorV2, MoveData, get_move_data
+from chess_vision.game.move_scorer import MoveDetectorV2, MoveData, get_move_data, should_undo
 from chess_vision.game.pgn import generate_pgn, save_pgn
 
 CORNERS_FILE = Path(__file__).parent.parent / "corners.json"
@@ -366,15 +366,24 @@ def _run_recording(args, caffeinate_proc):
     print(board)
     print()
 
-    frames_since_last_move = 0
     frame_count = 0
     greedy_pending = False
-    UNDO_CHECK_FRAMES = 10
-    RECALIBRATE_INTERVAL = 200  # Re-detect corners every ~10s at 20 FPS
-    HAND_TRIGGER_FRAMES = 2     # Consecutive low-count frames before freezing
-    hand_low_streak = 0
+    last_fire_time = 0.0          # time.monotonic() at most recent push
+    UNDO_CHECK_DELAY = 0.5        # seconds after fire before undo check runs
+    HAND_TRIGGER_DELAY = 0.15     # seconds of continuous low-count before freeze
+    HAND_RATIO_THRESHOLD = 0.5    # detected < 50% of expected => possible hand
+    hand_low_start: float | None = None
 
-    # Load xcorner detector for periodic recalibration
+    # Timing buckets for the debug HUD snapshot. Accumulated between
+    # snapshots, averaged and reset each snapshot. Useful to find the
+    # bottleneck when FPS is lower than expected.
+    timings: dict[str, list[float]] = {
+        "detect_raw": [], "detect_move": [], "draw_debug": [], "loop": [],
+    }
+
+    # Load xcorner detector (used only by the C-key auto-recalibration now;
+    # the mid-game periodic recalibration was removed - it always rejected
+    # in practice and cost CPU on every 200th frame).
     xcorner_det = None
     if XCORNERS_MODEL_PATH.exists():
         xcorner_det = XCornerDetector(str(XCORNERS_MODEL_PATH))
@@ -392,65 +401,45 @@ def _run_recording(args, caffeinate_proc):
 
             game_over = board.is_game_over()
 
-            # Periodically re-detect corners (handles board shifting mid-game).
-            # Mid-game we lock the new corners to the existing orientation
-            # (a1/a8/h8/h1 mapping) and only accept SMALL shifts. Large shifts
-            # almost always mean auto_detect_corners got confused (e.g. flipped
-            # the board) once the position is no longer the starting one.
-            if not game_over and xcorner_det and frame_count > 0 and frame_count % RECALIBRATE_INTERVAL == 0:
-                try:
-                    full_dets = detector.detect_raw(frame)
-                    new_corners = auto_detect_corners(full_dets, xcorner_det, frame)
-                    if new_corners is not None:
-                        aligned = align_to_existing(new_corners, corners)
-                        per_corner_shift = np.linalg.norm(aligned - corners, axis=1)
-                        max_shift = float(np.max(per_corner_shift))
-                        # Accept tiny adjustments only. Reject anything that
-                        # smells like an orientation swap or a detection blunder.
-                        accepted = 15 < max_shift < 80
-                        event_log.log("recalibrate", max_shift=round(max_shift, 1),
-                                      accepted=accepted)
-                        if accepted:
-                            corners = aligned
-                            square_centers = compute_square_centers(corners, frame.shape)
-                            crop_region = compute_crop_region(corners)
-                            board_quad = compute_board_quad(corners)
-                            # EMA was learned on the OLD square grid; reset so
-                            # square assignments re-learn from fresh detections.
-                            detector.state = np.zeros((64, 12), dtype=np.float32)
-                            detector.initialized = False
-                except Exception as e:
-                    print(f"[recalibrate] skipped: {e}")
-
+            _t0 = time.perf_counter()
             dets = detector.detect_raw(frame, crop_region=crop_region)
+            timings["detect_raw"].append(time.perf_counter() - _t0)
             update = detector.detections_to_board(dets, square_centers, board_quad)
 
             if args.debug_anchors and frame_count % 30 == 0:
                 debug_anchor_mapping(dets, square_centers, board_quad)
 
             # Hand detection: freeze state when piece count drops sustainedly.
-            # Single-frame dips (one bad detection) shouldn't trigger; otherwise
-            # noise freezes tracking and good moves get missed. Requires
-            # HAND_TRIGGER_FRAMES consecutive low frames before declaring a hand.
+            # Time-based (not frame-count-based) so it behaves the same at
+            # any FPS. Threshold softened to 50% - YOLO routinely misses a
+            # few pieces in a single frame, so 30% was too tight.
             expected_pieces = len([sq for sq in chess.SQUARES if board.piece_at(sq)])
             detected_pieces = int(np.sum(np.max(update, axis=1) > 0.3))
-            if detected_pieces < expected_pieces * 0.7:
-                hand_low_streak += 1
+            now_mono = time.monotonic()
+            if detected_pieces < expected_pieces * HAND_RATIO_THRESHOLD:
+                if hand_low_start is None:
+                    hand_low_start = now_mono
+                hand_on_board = (now_mono - hand_low_start) >= HAND_TRIGGER_DELAY
             else:
-                hand_low_streak = 0
-            hand_on_board = hand_low_streak >= HAND_TRIGGER_FRAMES
+                hand_low_start = None
+                hand_on_board = False
 
             if not hand_on_board:
                 detector.update_state(update)
             # else: don't update EMA, hand is blocking pieces
 
-            frames_since_last_move += 1
             frame_count += 1
 
             # Periodic snapshot of full state. ~1.5s cadence keeps the file
             # readable but loses no important transitions (events fill the
-            # gaps).
+            # gaps). Timings are averaged over the frames since the last
+            # snapshot, so the 'loop' field also tells us effective FPS.
             if frame_count % 30 == 0:
+                def _avg_ms(bucket: list[float]) -> float:
+                    return round(1000 * sum(bucket) / len(bucket), 1) if bucket else 0.0
+                hand_low_ms = 0.0 if hand_low_start is None else round(
+                    (time.monotonic() - hand_low_start) * 1000, 0
+                )
                 event_log.log(
                     "snapshot",
                     frame=frame_count,
@@ -464,19 +453,24 @@ def _run_recording(args, caffeinate_proc):
                     ],
                     last_fired=move_detector.last_move_san,
                     hand_on_board=hand_on_board,
-                    hand_low_streak=hand_low_streak,
+                    hand_low_ms=hand_low_ms,
                     detected_pieces=detected_pieces,
                     expected_pieces=expected_pieces,
                     greedy_pending=greedy_pending,
+                    timings_ms={k: _avg_ms(v) for k, v in timings.items()},
                 )
+                for bucket in timings.values():
+                    bucket.clear()
 
             # Draw debug every 3rd frame
             if not args.no_display and frame_count % 3 == 0:
+                _t0 = time.perf_counter()
                 debug = draw_debug(frame, dets, square_centers, board, san_history, corners,
                                    hand_on_board=hand_on_board,
                                    top_candidates=move_detector.top_candidates,
                                    last_fired=move_detector.last_move_san)
                 cv2.imshow("Chess Vision", debug)
+                timings["draw_debug"].append(time.perf_counter() - _t0)
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
                 break
@@ -487,32 +481,49 @@ def _run_recording(args, caffeinate_proc):
                 san_history.clear()
                 move_data_history.clear()
                 greedy_pending = False
-                frames_since_last_move = 0
-                hand_low_streak = 0
-                move_detector = MoveDetectorV2(greedy_delay=args.greedy_delay)
+                last_fire_time = 0.0
+                hand_low_start = None
+                move_detector = MoveDetectorV2(greedy_delay=args.greedy_delay, event_log=event_log)
                 # Re-snapshot the current board as the new reference
                 detector.state = np.zeros((64, 12), dtype=np.float32)
                 detector.initialized = False
             elif key == ord("c"):
-                # Re-select corners mid-game (board got bumped, etc).
-                # Manual selection, not auto-detect: auto orientation isn't
-                # reliable mid-game, manual click is.
-                print("Re-selecting corners (click a1, a8, h8, h1)...")
-                try:
-                    ret_calib, calib_frame = read_fresh(cap)
-                    if ret_calib:
-                        corners = select_corners(calib_frame)
-                        CORNERS_FILE.write_text(json.dumps(corners.tolist()))
-                        square_centers = compute_square_centers(corners, calib_frame.shape)
-                        crop_region = compute_crop_region(corners)
-                        board_quad = compute_board_quad(corners)
-                        # Pixel-to-square mapping changed; relearn EMA.
-                        detector.state = np.zeros((64, 12), dtype=np.float32)
-                        detector.initialized = False
-                        hand_low_streak = 0
-                        print("Corners updated. Game state preserved.")
-                except KeyboardInterrupt:
-                    print("Corner re-selection cancelled.")
+                # Re-detect corners mid-game. Try auto first; fall back to
+                # manual click if auto fails or isn't available. Auto-corners
+                # returns a guess that may be in the wrong rotation, so we
+                # run align_to_existing to keep the existing a1/a8/h8/h1
+                # orientation - user's mid-game intent is "board got bumped",
+                # not "I flipped the board."
+                ret_calib, calib_frame = read_fresh(cap)
+                new_corners = None
+                if ret_calib and xcorner_det is not None:
+                    print("Auto-detecting corners...")
+                    try:
+                        full_dets = detector.detect_raw(calib_frame)
+                        candidate = auto_detect_corners(full_dets, xcorner_det, calib_frame)
+                        if candidate is not None:
+                            new_corners = align_to_existing(candidate, corners)
+                            shift = float(np.max(np.linalg.norm(new_corners - corners, axis=1)))
+                            print(f"Auto-detected corners (max shift {shift:.0f}px).")
+                    except Exception as e:
+                        print(f"Auto-detect failed: {e}")
+                if new_corners is None and ret_calib:
+                    print("Falling back to manual selection. Click a1, a8, h8, h1.")
+                    try:
+                        new_corners = select_corners(calib_frame)
+                    except KeyboardInterrupt:
+                        print("Corner re-selection cancelled.")
+                        new_corners = None
+                if new_corners is not None:
+                    corners = new_corners
+                    CORNERS_FILE.write_text(json.dumps(corners.tolist()))
+                    square_centers = compute_square_centers(corners, calib_frame.shape)
+                    crop_region = compute_crop_region(corners)
+                    board_quad = compute_board_quad(corners)
+                    detector.state = np.zeros((64, 12), dtype=np.float32)
+                    detector.initialized = False
+                    hand_low_start = None
+                    print("Corners updated. Game state preserved.")
 
             # No more move detection once the game has ended.
             if game_over:
@@ -525,18 +536,16 @@ def _run_recording(args, caffeinate_proc):
             # Auto-undo: if last move was greedy and looks wrong, retract it.
             # Uses full MoveData so castling (rook squares) and en passant
             # (captured pawn square) are checked too, not just king/pawn travel.
-            if (greedy_pending and frames_since_last_move >= UNDO_CHECK_FRAMES):
+            if (greedy_pending and (time.monotonic() - last_fire_time) >= UNDO_CHECK_DELAY):
                 last_data = move_data_history[-1]
-                # Any of the from-squares still looking occupied -> undo
                 from_occ = max(
                     float(np.max(detector.state[sq])) for sq in last_data.from_squares
                 )
-                # Any to-square not showing the expected piece -> undo
                 to_occ = min(
                     float(detector.state[sq, last_data.targets[i]])
                     for i, sq in enumerate(last_data.to_squares)
                 )
-                if from_occ > 0.4 or to_occ < 0.2:
+                if should_undo(detector.state, last_data):
                     event_log.log("undo", san=last_data.san,
                                   from_occ=round(from_occ, 3), to_occ=round(to_occ, 3))
                     board.pop()
@@ -546,12 +555,13 @@ def _run_recording(args, caffeinate_proc):
                     greedy_pending = False
                     continue
                 else:
-                    # Move confirmed, no longer pending
                     event_log.log("confirm", san=last_data.san,
                                   from_occ=round(from_occ, 3), to_occ=round(to_occ, 3))
                     greedy_pending = False
 
+            _t0 = time.perf_counter()
             san = move_detector.detect_move(board, detector.state)
+            timings["detect_move"].append(time.perf_counter() - _t0)
             if san is None:
                 continue
 
@@ -568,13 +578,16 @@ def _run_recording(args, caffeinate_proc):
             move_history.append(move)
             san_history.append(san)
             move_data_history.append(move_data)
-            frames_since_last_move = 0
+            last_fire_time = time.monotonic()
             greedy_pending = True  # All moves start as tentative
 
             # Moves are shown in the display window, not terminal
 
-            # Sleep only the remaining time to hit target interval
+            # Sleep only the remaining time to hit target interval.
+            # Record 'loop' BEFORE the sleep so it measures actual work,
+            # not wall time (wall time is inferable from snapshot cadence).
             elapsed = time.monotonic() - loop_start
+            timings["loop"].append(elapsed)
             remaining = max(0, args.interval - elapsed)
             if remaining > 0:
                 time.sleep(remaining)
