@@ -118,17 +118,21 @@ def should_undo(state: np.ndarray, move: MoveData,
     return from_occ > from_threshold or to_occ < to_threshold
 
 
-def calculate_score(state: np.ndarray, move: MoveData, threshold: float = 0.55) -> float:
+def calculate_score(state: np.ndarray, move: MoveData, threshold: float = 0.45) -> float:
     """Score how well the state matrix matches a move.
 
     Matches ChessCam's calculateScore:
     - from squares: reward emptiness (1 - max_confidence - threshold)
     - to squares: reward correct piece (confidence - threshold)
 
-    Threshold was lowered from 0.60 to 0.55 after observing that
-    genuine small moves (e.g. Bf8-Be7) scored 0-0.1 and got filtered
-    out. Each threshold tick shifts every move's score by 2 * delta,
-    so 0.05 buys ~0.1 of headroom on both from- and to-sides.
+    Threshold history: 0.60 -> 0.55 -> 0.45. Sam's Bf1-Be2 attempt
+    failed at 0.55 because YOLO couldn't find the bishop anywhere on
+    the destination (state[e2,B]=0) so both from-side and to-side
+    subtracted T and the score stuck at ~ -0.10. At T=0.45 the same
+    state scores +0.10 - low but positive, so a weak to-side detection
+    (0.1-0.2 confidence) is enough to break ties via SCORE_MARGIN.
+    Full-zero-to-side moves still tie with other bishop options and
+    won't fire (correct).
     """
     score = 0.0
     for sq in move.from_squares:
@@ -148,7 +152,7 @@ class MoveDetectorV2:
     - Expiring possible_moves (stale candidates don't trigger two-move path)
     """
 
-    MIN_SCORE = 0.15         # Minimum score to accept a move
+    MIN_SCORE = 0.10         # Minimum score to accept a move
     SCORE_MARGIN = 0.1       # Top move must beat second-best by this much
     TWO_MOVE_DELAY = 0.3     # Time confirmation for two-move detections
     POSSIBLE_MOVE_TTL = 3.0  # Expire possible_moves after this many seconds
