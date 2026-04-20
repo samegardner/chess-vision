@@ -97,13 +97,15 @@ def _game_over_text(board: chess.Board) -> str | None:
 
 
 def draw_debug(frame, detections, square_centers, board, san_history, corners,
-               hand_on_board=False, top_candidates=None):
+               hand_on_board=False, top_candidates=None, last_fired=""):
     """Draw debug overlay. san_history is a pre-built list of SAN strings.
 
     top_candidates: optional list of (san, score) tuples (best first) from
     MoveDetectorV2.top_candidates, rendered as a small HUD so the user can
     see what the detector is considering when nothing crosses the firing
     threshold.
+    last_fired: MoveDetectorV2.last_move_san, shown so we can see if the
+    detector is stuck thinking a move was already played.
     """
     overlay = frame.copy()
     h, w = overlay.shape[:2]
@@ -198,6 +200,9 @@ def draw_debug(frame, detections, square_centers, board, san_history, corners,
             cv2.putText(panel, line, (15, y), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (180, 180, 180), 1)
 
     # Controls + move count at bottom
+    if last_fired:
+        cv2.putText(panel, f"Last fired: {last_fired}", (15, h - 45),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (120, 200, 200), 1)
     cv2.putText(panel, f"{len(san_history)} moves | Q=Quit  R=Reset  C=Corners", (15, h - 20),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
 
@@ -429,7 +434,8 @@ def _run_recording(args, caffeinate_proc):
             if not args.no_display and frame_count % 3 == 0:
                 debug = draw_debug(frame, dets, square_centers, board, san_history, corners,
                                    hand_on_board=hand_on_board,
-                                   top_candidates=move_detector.top_candidates)
+                                   top_candidates=move_detector.top_candidates,
+                                   last_fired=move_detector.last_move_san)
                 cv2.imshow("Chess Vision", debug)
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):

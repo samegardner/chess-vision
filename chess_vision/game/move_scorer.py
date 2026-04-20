@@ -234,6 +234,7 @@ class MoveDetectorV2:
                 self.two_move_times[san] = now
             elapsed = now - self.two_move_times[san]
             if elapsed >= self.TWO_MOVE_DELAY:
+                print(f"[detect] FIRE two-move {san} joint={best_joint_score:.2f} elapsed={elapsed:.1f}s")
                 self.possible_moves.clear()
                 self.greedy_times.clear()
                 self.two_move_times.clear()
@@ -254,10 +255,30 @@ class MoveDetectorV2:
             san = best_move.san
             elapsed = now - self.greedy_times[san]
             if elapsed > self.greedy_delay:
+                print(f"[detect] FIRE greedy {san} score={best_score1:.2f} "
+                      f"margin={best_score1 - second_score1:.2f} elapsed={elapsed:.1f}s")
                 self.possible_moves.clear()
                 self.greedy_times.clear()
                 self.two_move_times.clear()
                 self.last_move_san = san
                 return san
+
+        # Diagnostic: log why the top candidate is being held back, max once
+        # every 2 seconds so it doesn't spam.
+        if best_move is not None and best_move.san in self.greedy_times:
+            blockers = []
+            san = best_move.san
+            if best_score1 < self.MIN_SCORE:
+                blockers.append(f"score{best_score1:.2f}<MIN({self.MIN_SCORE})")
+            if best_score1 - second_score1 < self.SCORE_MARGIN:
+                blockers.append(f"margin{best_score1 - second_score1:.2f}<MARGIN({self.SCORE_MARGIN})")
+            if san == self.last_move_san:
+                blockers.append(f"san==last_fired({self.last_move_san!r})")
+            elapsed = now - self.greedy_times[san]
+            if elapsed <= self.greedy_delay:
+                blockers.append(f"elapsed{elapsed:.1f}<=delay({self.greedy_delay})")
+            if blockers and now - getattr(self, "_last_blocker_log", 0.0) > 2.0:
+                self._last_blocker_log = now
+                print(f"[detect] {san} blocked: {', '.join(blockers)}")
 
         return None
