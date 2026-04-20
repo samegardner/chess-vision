@@ -98,12 +98,17 @@ def get_move_pairs(board: chess.Board) -> list[MovePair]:
     return pairs
 
 
-def calculate_score(state: np.ndarray, move: MoveData, threshold: float = 0.6) -> float:
+def calculate_score(state: np.ndarray, move: MoveData, threshold: float = 0.55) -> float:
     """Score how well the state matrix matches a move.
 
-    Exactly matches ChessCam's calculateScore:
+    Matches ChessCam's calculateScore:
     - from squares: reward emptiness (1 - max_confidence - threshold)
     - to squares: reward correct piece (confidence - threshold)
+
+    Threshold was lowered from 0.60 to 0.55 after observing that
+    genuine small moves (e.g. Bf8-Be7) scored 0-0.1 and got filtered
+    out. Each threshold tick shifts every move's score by 2 * delta,
+    so 0.05 buys ~0.1 of headroom on both from- and to-sides.
     """
     score = 0.0
     for sq in move.from_squares:
@@ -136,6 +141,10 @@ class MoveDetectorV2:
         self.last_move_san: str = ""
         self._cached_pairs: list[MovePair] | None = None
         self._cached_fen: str = ""
+        # Top candidates from the most recent detect_move call, sorted by score.
+        # Exposed for the debug HUD so the user can see what the detector is
+        # considering even when nothing crosses the firing threshold.
+        self.top_candidates: list[tuple[str, float]] = []
 
     def detect_move(self, board: chess.Board, state: np.ndarray) -> str | None:
         now = time.time()
@@ -164,11 +173,13 @@ class MoveDetectorV2:
         best_combined: MoveData | None = None
         best_combined_san: str = ""
         seen: set[str] = set()
+        all_scores: list[tuple[str, float]] = []  # for the debug HUD
 
         for pair in pairs:
             if pair.move1.san not in seen:
                 seen.add(pair.move1.san)
                 score1 = calculate_score(state, pair.move1)
+                all_scores.append((pair.move1.san, score1))
                 if score1 > 0:
                     self.possible_moves[pair.move1.san] = now
                 if score1 > best_score1:
@@ -191,6 +202,10 @@ class MoveDetectorV2:
                 best_combined_san = pair.move1.san
             elif joint_score > second_joint_score:
                 second_joint_score = joint_score
+
+        # Stash top 3 candidates for the HUD (always, even when we fire a move).
+        all_scores.sort(key=lambda x: -x[1])
+        self.top_candidates = all_scores[:3]
 
         # Two-move detection (with time confirmation + score margin)
         if (best_combined is not None

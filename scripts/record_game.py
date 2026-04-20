@@ -97,8 +97,14 @@ def _game_over_text(board: chess.Board) -> str | None:
 
 
 def draw_debug(frame, detections, square_centers, board, san_history, corners,
-               hand_on_board=False):
-    """Draw debug overlay. san_history is a pre-built list of SAN strings."""
+               hand_on_board=False, top_candidates=None):
+    """Draw debug overlay. san_history is a pre-built list of SAN strings.
+
+    top_candidates: optional list of (san, score) tuples (best first) from
+    MoveDetectorV2.top_candidates, rendered as a small HUD so the user can
+    see what the detector is considering when nothing crosses the firing
+    threshold.
+    """
     overlay = frame.copy()
     h, w = overlay.shape[:2]
 
@@ -147,8 +153,23 @@ def draw_debug(frame, detections, square_centers, board, san_history, corners,
     elif hand_on_board:
         cv2.putText(panel, "HAND DETECTED", (15, 125), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
+    # Top-3 candidates HUD (lets the user see what the detector is "thinking"
+    # even when nothing crosses the firing threshold).
+    hud_y = 160
+    if top_candidates:
+        cv2.putText(panel, "Considering:", (15, hud_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 180, 180), 1)
+        hud_y += 25
+        for san, score in top_candidates:
+            color = (100, 255, 100) if score >= 0.15 else (
+                (180, 180, 100) if score > 0 else (140, 140, 140))
+            cv2.putText(panel, f"  {san:<7} {score:+.2f}", (15, hud_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1)
+            hud_y += 22
+        hud_y += 8
+
     # Move list
-    y_start = 160
+    y_start = max(160, hud_y + 5)
     line_height = 35
     max_moves_shown = (h - y_start - 60) // line_height
 
@@ -171,8 +192,8 @@ def draw_debug(frame, detections, square_centers, board, san_history, corners,
             cv2.putText(panel, line, (15, y), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (180, 180, 180), 1)
 
     # Controls + move count at bottom
-    cv2.putText(panel, f"{len(san_history)} moves | Q=Quit  R=Reset", (15, h - 20),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (150, 150, 150), 1)
+    cv2.putText(panel, f"{len(san_history)} moves | Q=Quit  R=Reset  C=Corners", (15, h - 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
 
     # Combine frame + panel
     combined = np.hstack([overlay, panel])
@@ -401,7 +422,8 @@ def _run_recording(args, caffeinate_proc):
             # Draw debug every 3rd frame
             if not args.no_display and frame_count % 3 == 0:
                 debug = draw_debug(frame, dets, square_centers, board, san_history, corners,
-                                   hand_on_board=hand_on_board)
+                                   hand_on_board=hand_on_board,
+                                   top_candidates=move_detector.top_candidates)
                 cv2.imshow("Chess Vision", debug)
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
@@ -419,6 +441,26 @@ def _run_recording(args, caffeinate_proc):
                 # Re-snapshot the current board as the new reference
                 detector.state = np.zeros((64, 12), dtype=np.float32)
                 detector.initialized = False
+            elif key == ord("c"):
+                # Re-select corners mid-game (board got bumped, etc).
+                # Manual selection, not auto-detect: auto orientation isn't
+                # reliable mid-game, manual click is.
+                print("Re-selecting corners (click a1, a8, h8, h1)...")
+                try:
+                    ret_calib, calib_frame = read_fresh(cap)
+                    if ret_calib:
+                        corners = select_corners(calib_frame)
+                        CORNERS_FILE.write_text(json.dumps(corners.tolist()))
+                        square_centers = compute_square_centers(corners, calib_frame.shape)
+                        crop_region = compute_crop_region(corners)
+                        board_quad = compute_board_quad(corners)
+                        # Pixel-to-square mapping changed; relearn EMA.
+                        detector.state = np.zeros((64, 12), dtype=np.float32)
+                        detector.initialized = False
+                        hand_low_streak = 0
+                        print("Corners updated. Game state preserved.")
+                except KeyboardInterrupt:
+                    print("Corner re-selection cancelled.")
 
             # No more move detection once the game has ended.
             if game_over:
