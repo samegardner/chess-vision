@@ -159,6 +159,15 @@ class MoveDetectorV2:
         if fen != self._cached_fen:
             self._cached_pairs = get_move_pairs(board)
             self._cached_fen = fen
+            # Position changed (push or pop). Anything we tracked about the
+            # previous position - timers, possible_moves, "last fired SAN" -
+            # is now stale. Castling collision (white "O-O" then black "O-O")
+            # would otherwise permanently block black's castle, since the
+            # SAN literal is identical across colors.
+            self.greedy_times.clear()
+            self.possible_moves.clear()
+            self.two_move_times.clear()
+            self.last_move_san = ""
         pairs = self._cached_pairs
 
         # Expire stale possible_moves

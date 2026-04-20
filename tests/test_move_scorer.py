@@ -115,6 +115,53 @@ def test_pgn_generation():
     assert "W" in pgn
 
 
+def test_castling_collision_does_not_block_opposite_color(monkeypatch):
+    """White "O-O" and black "O-O" share the same SAN literal. After white
+    castles, last_move_san = "O-O"; the 'same san as last fire' guard must
+    NOT block black's castle. Cache rebuild on position change should clear
+    last_move_san so the new position starts fresh.
+    """
+    import time as time_module
+    fake_now = [1000.0]
+    monkeypatch.setattr(time_module, "time", lambda: fake_now[0])
+
+    detector = MoveDetectorV2(greedy_delay=1.0)
+
+    # Position where white can castle kingside (king e1, rook h1, path clear).
+    board = chess.Board("rnbqk2r/pppp1ppp/5n2/4p3/4P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4")
+    # Set up state so white O-O scores high
+    state = np.zeros((64, 12), dtype=np.float32)
+    for sq in chess.SQUARES:
+        piece = board.piece_at(sq)
+        if piece:
+            state[sq, LABEL_MAP[piece.symbol()]] = 0.85
+    # Simulate white having castled: king on g1, rook on f1, e1/h1 empty.
+    state[chess.E1] = np.zeros(12)
+    state[chess.H1] = np.zeros(12)
+    state[chess.G1, LABEL_MAP["K"]] = 0.85
+    state[chess.F1, LABEL_MAP["R"]] = 0.85
+
+    # Fire white's castle
+    assert detector.detect_move(board, state) is None  # timer start
+    fake_now[0] += 1.5
+    assert detector.detect_move(board, state) == "O-O"
+
+    # Main-loop equivalent: push the move. Position changes to black's turn.
+    board.push_san("O-O")
+
+    # Now set state to look like black has also castled (king g8, rook f8).
+    state[chess.E8] = np.zeros(12)
+    state[chess.H8] = np.zeros(12)
+    state[chess.G8, LABEL_MAP["k"]] = 0.85
+    state[chess.F8, LABEL_MAP["r"]] = 0.85
+
+    # Black O-O must be able to fire despite sharing the "O-O" literal.
+    fake_now[0] += 0.1
+    assert detector.detect_move(board, state) is None  # timer starts fresh on new fen
+    fake_now[0] += 1.5
+    assert detector.detect_move(board, state) == "O-O"
+
+
 def test_cache_invalidates_on_ep_rights_change():
     """Same piece placement + same turn but different EP rights must rebuild
     the move pair cache. board_fen() drops EP, so the cache key has to use
