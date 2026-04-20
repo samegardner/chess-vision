@@ -154,16 +154,22 @@ def draw_debug(frame, detections, square_centers, board, san_history, corners,
         cv2.putText(panel, "HAND DETECTED", (15, 125), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
     # Top-3 candidates HUD (lets the user see what the detector is "thinking"
-    # even when nothing crosses the firing threshold).
+    # even when nothing crosses the firing threshold). Each line:
+    #   <san>  <score>  [<timer>s]   where timer is the move's greedy clock.
+    # When timer reaches greedy_delay (default 1.0s), the move fires.
     hud_y = 160
     if top_candidates:
         cv2.putText(panel, "Considering:", (15, hud_y),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 180, 180), 1)
         hud_y += 25
-        for san, score in top_candidates:
+        for entry in top_candidates:
+            # Backwards compatible: entry may be (san, score) or (san, score, timer)
+            san, score = entry[0], entry[1]
+            timer = entry[2] if len(entry) > 2 else 0.0
             color = (100, 255, 100) if score >= 0.15 else (
                 (180, 180, 100) if score > 0 else (140, 140, 140))
-            cv2.putText(panel, f"  {san:<7} {score:+.2f}", (15, hud_y),
+            timer_str = f"[{timer:.1f}s]" if timer > 0 else ""
+            cv2.putText(panel, f"  {san:<7} {score:+.2f}  {timer_str}", (15, hud_y),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1)
             hud_y += 22
         hud_y += 8

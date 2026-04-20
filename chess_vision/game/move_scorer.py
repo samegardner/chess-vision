@@ -203,9 +203,25 @@ class MoveDetectorV2:
             elif joint_score > second_joint_score:
                 second_joint_score = joint_score
 
-        # Stash top 3 candidates for the HUD (always, even when we fire a move).
+        # Update greedy timers proactively for ANY positive-scoring move.
+        # Decoupling timer accumulation from "is currently best?" lets a move
+        # with a fluctuating score survive brief frames where another move
+        # momentarily takes the top spot. Without this, oscillation between
+        # candidates kept resetting the leader's timer and Bd7-style moves
+        # never confirmed even when consistently dominant.
+        for san, score in all_scores:
+            if score > 0:
+                if san not in self.greedy_times:
+                    self.greedy_times[san] = now
+            else:
+                self.greedy_times.pop(san, None)
+
+        # Stash top 3 candidates (with their timer age) for the HUD.
         all_scores.sort(key=lambda x: -x[1])
-        self.top_candidates = all_scores[:3]
+        self.top_candidates = [
+            (san, score, max(0.0, now - self.greedy_times.get(san, now)))
+            for san, score in all_scores[:3]
+        ]
 
         # Two-move detection (with time confirmation + score margin)
         if (best_combined is not None
@@ -226,29 +242,22 @@ class MoveDetectorV2:
         else:
             self.two_move_times.clear()
 
-        # Greedy fallback (single move, requires time confirmation + score margin)
+        # Greedy fallback: fire if the current best meets margin AND has had
+        # a timer running for at least greedy_delay. Timer was set above the
+        # moment the move first scored positive, so brief wobbles where
+        # another move took #1 don't reset it.
         if (best_move is not None
                 and best_score1 >= self.MIN_SCORE
-                and best_score1 - second_score1 >= self.SCORE_MARGIN):
+                and best_score1 - second_score1 >= self.SCORE_MARGIN
+                and best_move.san in self.greedy_times
+                and best_move.san != self.last_move_san):
             san = best_move.san
-            if san not in self.greedy_times:
-                self.greedy_times[san] = now
-
             elapsed = now - self.greedy_times[san]
-            is_new = san != self.last_move_san
-
-            if elapsed > self.greedy_delay and is_new:
+            if elapsed > self.greedy_delay:
                 self.possible_moves.clear()
                 self.greedy_times.clear()
                 self.two_move_times.clear()
                 self.last_move_san = san
                 return san
-
-        # Clean up stale greedy times (only keep current top candidate)
-        if best_move is not None:
-            self.greedy_times = {
-                san: t for san, t in self.greedy_times.items()
-                if san == best_move.san
-            }
 
         return None
