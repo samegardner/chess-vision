@@ -133,7 +133,7 @@ class MoveDetectorV2:
     TWO_MOVE_DELAY = 0.3     # Time confirmation for two-move detections
     POSSIBLE_MOVE_TTL = 3.0  # Expire possible_moves after this many seconds
 
-    def __init__(self, greedy_delay: float = 1.0):
+    def __init__(self, greedy_delay: float = 1.0, event_log=None):
         self.possible_moves: dict[str, float] = {}  # san -> last_seen_time
         self.greedy_times: dict[str, float] = {}
         self.two_move_times: dict[str, float] = {}
@@ -145,6 +145,9 @@ class MoveDetectorV2:
         # Exposed for the debug HUD so the user can see what the detector is
         # considering even when nothing crosses the firing threshold.
         self.top_candidates: list[tuple[str, float]] = []
+        # Optional structured logger; left None means no-op.
+        from chess_vision.event_log import NullEventLog
+        self.event_log = event_log if event_log is not None else NullEventLog()
 
     def detect_move(self, board: chess.Board, state: np.ndarray) -> str | None:
         now = time.time()
@@ -235,6 +238,9 @@ class MoveDetectorV2:
             elapsed = now - self.two_move_times[san]
             if elapsed >= self.TWO_MOVE_DELAY:
                 print(f"[detect] FIRE two-move {san} joint={best_joint_score:.2f} elapsed={elapsed:.1f}s")
+                self.event_log.log("fire", path="two-move", san=san,
+                                   joint_score=round(best_joint_score, 3),
+                                   elapsed=round(elapsed, 2))
                 self.possible_moves.clear()
                 self.greedy_times.clear()
                 self.two_move_times.clear()
@@ -257,6 +263,10 @@ class MoveDetectorV2:
             if elapsed > self.greedy_delay:
                 print(f"[detect] FIRE greedy {san} score={best_score1:.2f} "
                       f"margin={best_score1 - second_score1:.2f} elapsed={elapsed:.1f}s")
+                self.event_log.log("fire", path="greedy", san=san,
+                                   score=round(best_score1, 3),
+                                   margin=round(best_score1 - second_score1, 3),
+                                   elapsed=round(elapsed, 2))
                 self.possible_moves.clear()
                 self.greedy_times.clear()
                 self.two_move_times.clear()
@@ -280,5 +290,10 @@ class MoveDetectorV2:
             if blockers and now - getattr(self, "_last_blocker_log", 0.0) > 2.0:
                 self._last_blocker_log = now
                 print(f"[detect] {san} blocked: {', '.join(blockers)}")
+                self.event_log.log("blocked", san=san, score=round(best_score1, 3),
+                                   margin=round(best_score1 - second_score1, 3),
+                                   timer=round(elapsed, 2),
+                                   last_fired=self.last_move_san,
+                                   reasons=blockers)
 
         return None

@@ -24,6 +24,7 @@ from chess_vision.inference.yolo_detect import (
     YoloPieceDetector, compute_square_centers, compute_crop_region,
     compute_board_quad,
 )
+from chess_vision.event_log import EventLog
 from chess_vision.game.move_scorer import MoveDetectorV2, MoveData, get_move_data
 from chess_vision.game.pgn import generate_pgn, save_pgn
 
@@ -338,11 +339,24 @@ def _run_recording(args, caffeinate_proc):
     occupied = int(np.sum(np.max(detector.state, axis=1) > 0.3))
     print(f"Ready! ({occupied} squares look occupied)")
 
+    # Structured event log: one JSONL file per game, hand to Claude after
+    # play to reconstruct exactly what the detector saw and decided.
+    from datetime import datetime
+    session_timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    games_dir = Path(__file__).parent.parent / "games"
+    games_dir.mkdir(exist_ok=True)
+    debug_log_path = games_dir / f"{session_timestamp}_{args.white}_vs_{args.black}_debug.jsonl"
+    event_log = EventLog(debug_log_path)
+    event_log.log("session_start", white=args.white, black=args.black,
+                  greedy_delay=args.greedy_delay, ema=args.ema, interval=args.interval,
+                  corners=corners.tolist())
+    print(f"Event log: {debug_log_path}")
+
     board = chess.Board()
     move_history: list[chess.Move] = []
     san_history: list[str] = []  # Cached SAN strings (avoids replaying game each frame)
     move_data_history: list[MoveData] = []  # Per-move from/to squares + targets, for undo
-    move_detector = MoveDetectorV2(greedy_delay=args.greedy_delay)
+    move_detector = MoveDetectorV2(greedy_delay=args.greedy_delay, event_log=event_log)
 
     print()
     print("=== RECORDING ===")
@@ -393,7 +407,10 @@ def _run_recording(args, caffeinate_proc):
                         max_shift = float(np.max(per_corner_shift))
                         # Accept tiny adjustments only. Reject anything that
                         # smells like an orientation swap or a detection blunder.
-                        if 15 < max_shift < 80:
+                        accepted = 15 < max_shift < 80
+                        event_log.log("recalibrate", max_shift=round(max_shift, 1),
+                                      accepted=accepted)
+                        if accepted:
                             corners = aligned
                             square_centers = compute_square_centers(corners, frame.shape)
                             crop_region = compute_crop_region(corners)
@@ -429,6 +446,29 @@ def _run_recording(args, caffeinate_proc):
 
             frames_since_last_move += 1
             frame_count += 1
+
+            # Periodic snapshot of full state. ~1.5s cadence keeps the file
+            # readable but loses no important transitions (events fill the
+            # gaps).
+            if frame_count % 30 == 0:
+                event_log.log(
+                    "snapshot",
+                    frame=frame_count,
+                    fen=board.fen(),
+                    turn="white" if board.turn == chess.WHITE else "black",
+                    moves=len(move_history),
+                    candidates=[
+                        {"san": entry[0], "score": round(entry[1], 3),
+                         "timer": round(entry[2] if len(entry) > 2 else 0.0, 2)}
+                        for entry in move_detector.top_candidates
+                    ],
+                    last_fired=move_detector.last_move_san,
+                    hand_on_board=hand_on_board,
+                    hand_low_streak=hand_low_streak,
+                    detected_pieces=detected_pieces,
+                    expected_pieces=expected_pieces,
+                    greedy_pending=greedy_pending,
+                )
 
             # Draw debug every 3rd frame
             if not args.no_display and frame_count % 3 == 0:
@@ -497,6 +537,8 @@ def _run_recording(args, caffeinate_proc):
                     for i, sq in enumerate(last_data.to_squares)
                 )
                 if from_occ > 0.4 or to_occ < 0.2:
+                    event_log.log("undo", san=last_data.san,
+                                  from_occ=round(from_occ, 3), to_occ=round(to_occ, 3))
                     board.pop()
                     move_history.pop()
                     san_history.pop()
@@ -505,6 +547,8 @@ def _run_recording(args, caffeinate_proc):
                     continue
                 else:
                     # Move confirmed, no longer pending
+                    event_log.log("confirm", san=last_data.san,
+                                  from_occ=round(from_occ, 3), to_occ=round(to_occ, 3))
                     greedy_pending = False
 
             san = move_detector.detect_move(board, detector.state)
@@ -538,6 +582,10 @@ def _run_recording(args, caffeinate_proc):
     except KeyboardInterrupt:
         print("\n\nStopped.")
     finally:
+        event_log.log("session_end", moves=len(move_history),
+                      final_fen=board.fen(),
+                      game_over=board.is_game_over())
+        event_log.close()
         cap.release()
         if not args.no_display:
             cv2.destroyAllWindows()
@@ -559,12 +607,9 @@ def _run_recording(args, caffeinate_proc):
             # Save to specified output
             save_pgn(pgn, Path(args.output))
 
-            # Also save to games/ with timestamp
-            from datetime import datetime
-            games_dir = Path(__file__).parent.parent / "games"
-            games_dir.mkdir(exist_ok=True)
-            timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-            game_file = games_dir / f"{timestamp}_{args.white}_vs_{args.black}.pgn"
+            # Save PGN with the SAME session_timestamp as the debug log so
+            # the two files are easy to pair up afterwards.
+            game_file = games_dir / f"{session_timestamp}_{args.white}_vs_{args.black}.pgn"
             save_pgn(pgn, game_file)
 
             # Copy PGN to clipboard
