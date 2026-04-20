@@ -103,18 +103,24 @@ def should_undo(state: np.ndarray, move: MoveData,
     """Check whether the smoothed state still agrees with the last move.
 
     Returns True if the state suggests the move was a false positive:
-    either a from-square still looks occupied (piece didn't actually leave),
-    or any to-square fails to show the expected piece (didn't arrive).
+    a from-square still looks occupied (piece didn't actually leave),
+    OR the PRIMARY to-square fails to show the expected piece.
 
-    Covers regular moves, captures, castling (rook squares included in
-    move.from_squares / move.to_squares / move.targets), and en passant
-    (the captured pawn's square is included in move.from_squares).
+    For castling, move.to_squares has two entries: the king's destination
+    (index 0) and the rook's destination (index 1). The rook is small and
+    easily missed by YOLO at oblique camera angles - requiring it would
+    spuriously undo legitimate castles. We check only the primary (first)
+    to-square; the from-side check still catches the case where the rook
+    never actually moved (it'd still be detected on h1/a1).
+
+    For en passant, from_squares includes the captured pawn's square, so
+    a "captured pawn still there" condition triggers via from-side. Only
+    one to-square (the capturing pawn's destination), still checked.
     """
     from_occ = max(float(np.max(state[sq])) for sq in move.from_squares)
-    to_occ = min(
-        float(state[sq, move.targets[i]])
-        for i, sq in enumerate(move.to_squares)
-    )
+    primary_to_sq = move.to_squares[0]
+    primary_target = move.targets[0]
+    to_occ = float(state[primary_to_sq, primary_target])
     return from_occ > from_threshold or to_occ < to_threshold
 
 

@@ -145,6 +145,25 @@ def test_should_undo_castling_fires_when_rook_stuck():
     assert should_undo(state, data) is True
 
 
+def test_should_undo_castling_kept_when_rook_detection_missing():
+    """Sam hit this in a real game: white O-O fired six times in a row
+    and got undone every time because YOLO consistently failed to detect
+    the rook on f1 (small piece, partially behind the king). The king on
+    g1 is clearly visible. should_undo must NOT fire if the king landed
+    correctly, even when the rook detection is missing - the from-side
+    check (state[h1] empty) is enough to confirm the castle happened."""
+    board = chess.Board("rnbqk2r/pppp1ppp/5n2/4p3/4P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4")
+    move = board.parse_san("O-O")
+    data = get_move_data(board, move)
+
+    state = np.zeros((64, 12), dtype=np.float32)
+    state[chess.G1, LABEL_MAP["K"]] = 0.85   # king clearly landed
+    # state[chess.F1, LABEL_MAP["R"]] = 0    # rook NOT detected (the bug)
+    # e1 and h1 are both empty (rook moved, king moved) -> from-side ok
+
+    assert should_undo(state, data) is False
+
+
 def test_should_undo_en_passant_kept_when_captured_pawn_gone():
     """After exd6 e.p., d5 (captured pawn) must be empty. should_undo
     should NOT fire when state reflects that."""
