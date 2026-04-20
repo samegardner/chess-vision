@@ -53,12 +53,15 @@ def align_to_existing(new_corners: np.ndarray, old_corners: np.ndarray) -> np.nd
     return best
 
 
-def read_fresh(cap, drain: int = 4):
+def read_fresh(cap, drain: int = 1):
     """Read the latest frame, dropping any stale buffered ones first.
 
-    Internal capture buffers can hold ~5 frames; without draining, cap.read()
-    returns the OLDEST one, so EMA learns from a frame ~250ms in the past.
-    grab() decodes nothing, so draining is cheap.
+    With CAP_PROP_BUFFERSIZE=1 set on the capture, the internal buffer
+    is small. We do one extra grab() before retrieve() to handle the
+    one-frame backlog that AVFoundation often keeps anyway. Drain was
+    previously 4 but each grab on macOS AVFoundation is ~40ms, so 4
+    grabs cost ~160ms per loop - 75% of the per-frame time. Dropping
+    to 1 cut the loop time roughly in half.
     """
     for _ in range(drain):
         if not cap.grab():
