@@ -12,7 +12,12 @@ import cv2
 import numpy as np
 import onnxruntime as ort
 
-from chess_vision.inference.yolo_detect import letterbox_resize, MODEL_WIDTH, MODEL_HEIGHT
+import chess
+
+from chess_vision.inference.yolo_detect import (
+    letterbox_resize, MODEL_WIDTH, MODEL_HEIGHT,
+    compute_square_centers, compute_board_quad, point_in_quad,
+)
 
 
 class XCornerDetector:
@@ -105,14 +110,106 @@ def _find_board_corners_from_xcorners(xcorners: np.ndarray) -> np.ndarray | None
     return np.array([board_tl, board_tr, board_br, board_bl], dtype=np.float32)
 
 
+def _all_orientations(tl, tr, br, bl) -> list[list]:
+    """Enumerate every valid (a1, a8, h8, h1) labeling of 4 board corners.
+
+    For each of the 4 corners that could be a1, there are 2 possible
+    chiralities depending on which adjacent corner is a8 (CW vs CCW
+    around the board). 4 starting points x 2 directions = 8 orientations.
+    """
+    cw = [
+        [tl, tr, br, bl],   # a1=TL, a8=TR (CW)
+        [tr, br, bl, tl],   # a1=TR, a8=BR
+        [br, bl, tl, tr],   # a1=BR, a8=BL
+        [bl, tl, tr, br],   # a1=BL, a8=TL
+    ]
+    ccw = [
+        [tl, bl, br, tr],   # a1=TL, a8=BL (CCW)
+        [tr, tl, bl, br],   # a1=TR, a8=TL
+        [br, tr, tl, bl],   # a1=BR, a8=TR
+        [bl, br, tr, tl],   # a1=BL, a8=BR
+    ]
+    return cw + ccw
+
+
+def _score_orientation(
+    corners: np.ndarray,
+    piece_detections: list[dict],
+    image_shape: tuple,
+    min_conf: float = 0.3,
+) -> float:
+    """Score an (a1, a8, h8, h1) orientation by how well YOLO detections
+    match the standard starting position.
+
+    For every detection, find the square it'd be assigned to under this
+    orientation, look up what piece SHOULD be there in the starting
+    position, and add the detection's confidence if the class matches.
+    Pieces detected on empty squares (ranks 3-6) and class mismatches
+    contribute zero. Robust against any single piece being misclassified
+    by YOLO, because the scoring uses all 32 pieces as voters.
+    """
+    centers = compute_square_centers(corners, image_shape)
+    quad = compute_board_quad(corners)
+    starting = chess.Board()
+
+    score = 0.0
+    for det in piece_detections:
+        if det["confidence"] < min_conf:
+            continue
+        ax = det["cx"]
+        ay = det["cy"] + det["h"] / 2 - det["w"] / 3
+        if not point_in_quad(np.array([ax, ay]), quad):
+            continue
+        dists = np.sqrt(
+            (centers[:, 0] - ax) ** 2 + (centers[:, 1] - ay) ** 2
+        )
+        sq_idx = int(np.argmin(dists))
+        expected = starting.piece_at(sq_idx)
+        if expected is None:
+            continue
+        if det["class_name"] == expected.symbol():
+            score += det["confidence"]
+    return score
+
+
+def _match_to_existing_labels(hull_corners: list, existing: np.ndarray) -> np.ndarray:
+    """Assign [a1, a8, h8, h1] labels to hull_corners by matching each
+    existing labeled corner to its nearest hull corner. Used by mid-game
+    C-key re-detection to keep orientation stable across a small board
+    bump without re-running starting-position heuristics (which don't
+    work once pieces have moved)."""
+    hull_arr = np.array(hull_corners, dtype=np.float32)
+    result = np.zeros((4, 2), dtype=np.float32)
+    used = set()
+    for i, label_pos in enumerate(existing):
+        best_idx = -1
+        best_dist = float("inf")
+        for j in range(len(hull_arr)):
+            if j in used:
+                continue
+            d = float(np.linalg.norm(hull_arr[j] - label_pos))
+            if d < best_dist:
+                best_dist = d
+                best_idx = j
+        result[i] = hull_arr[best_idx]
+        used.add(best_idx)
+    return result
+
+
 def auto_detect_corners(
     piece_detections: list[dict],
     xcorner_detector: XCornerDetector,
     image: np.ndarray,
+    existing_corners: np.ndarray | None = None,
 ) -> np.ndarray | None:
     """Auto-detect board corners and orientation.
 
     Returns (4, 2) corners in [a1, a8, h8, h1] order, or None if failed.
+
+    If existing_corners is given, each label is matched to the nearest
+    newly-detected corner - stable for mid-game re-detection. Otherwise
+    we score all 8 orientations against the standard starting position,
+    which is the right choice at launch.
     """
     # Step 1: Crop to piece region
     good_pieces = [d for d in piece_detections if d["confidence"] > 0.2]
@@ -143,79 +240,33 @@ def auto_detect_corners(
 
     tl, tr, br, bl = board_corners
 
-    # Step 4: Determine orientation from piece colors
-    white_pieces = [d for d in piece_detections if d["class_name"].isupper() and d["confidence"] > 0.3]
-    black_pieces = [d for d in piece_detections if d["class_name"].islower() and d["confidence"] > 0.3]
+    # Mid-game re-detection: match each existing labeled corner to the
+    # nearest new hull corner. Preserves orientation, doesn't depend on
+    # starting-position assumptions.
+    if existing_corners is not None:
+        return _match_to_existing_labels([tl, tr, br, bl], existing_corners)
 
-    if len(white_pieces) < 4 or len(black_pieces) < 4:
+    # Initial detection: pick the orientation that best matches the
+    # standard starting position. Replaces the older centroid + Q/K
+    # heuristic (which broke whenever YOLO confused King and Queen,
+    # since both are tall pieces on the back rank). The new approach
+    # uses all detected pieces as voters - the only way for it to
+    # mis-orient is for several class predictions to coincidentally
+    # match a wrong layout, which is overwhelmingly unlikely.
+    if len(piece_detections) < 8:
         return None
 
-    white_centroid = np.mean([[d["cx"], d["cy"]] for d in white_pieces], axis=0)
-    black_centroid = np.mean([[d["cx"], d["cy"]] for d in black_pieces], axis=0)
+    candidates = _all_orientations(tl, tr, br, bl)
+    scored = []
+    for orient in candidates:
+        c = np.array(orient, dtype=np.float32)
+        score = _score_orientation(c, piece_detections, image.shape)
+        scored.append((score, c))
+    scored.sort(key=lambda x: -x[0])
 
-    # Try all 4 edge assignments: [a1, a8, h8, h1]
-    # a1 and h1 must be on the SAME edge (white's back rank)
-    # a8 and h8 must be on the OPPOSITE edge (black's back rank)
-    # The 4 options correspond to which edge is white's:
-    rotations = [
-        [bl, tl, tr, br],  # Bottom edge = white (a1=BL, h1=BR)
-        [tl, tr, br, bl],  # Left edge = white  (a1=TL, h1=BL)
-        [tr, br, bl, tl],  # Top edge = white   (a1=TR, h1=TL)
-        [br, bl, tl, tr],  # Right edge = white (a1=BR, h1=TR)
-    ]
-
-    best_rotation = None
-    best_score = -float("inf")
-
-    for rot in rotations:
-        a1, a8, h8, h1 = rot
-        white_edge = (np.array(a1) + np.array(h1)) / 2
-        black_edge = (np.array(a8) + np.array(h8)) / 2
-        score = -(np.linalg.norm(white_centroid - white_edge) + np.linalg.norm(black_centroid - black_edge))
-        if score > best_score:
-            best_score = score
-            best_rotation = rot
-
-    if best_rotation is None:
+    # If the top two scores tie, we don't trust the result - return None
+    # so the caller can fall back to a saved corners.json or manual click.
+    if len(scored) >= 2 and scored[0][0] - scored[1][0] < 0.5:
         return None
 
-    # Step 5: Disambiguate a-file vs h-file using Queen/King positions
-    # The Queen is on d1 (a-file half) and King on e1 (h-file half).
-    # Project Queen and King positions onto the rank-1 edge vector.
-    # Queen should project closer to the a1 end, King to h1 end.
-    a1, a8, h8, h1 = best_rotation
-    a1_pos = np.array(a1)
-    h1_pos = np.array(h1)
-    edge_vec = h1_pos - a1_pos  # Vector from a1 to h1
-    edge_len = np.linalg.norm(edge_vec)
-
-    if edge_len < 1:
-        return np.array(best_rotation, dtype=np.float32)
-
-    edge_unit = edge_vec / edge_len
-
-    white_queens = [d for d in piece_detections if d["class_name"] == "Q" and d["confidence"] > 0.3]
-    white_kings = [d for d in piece_detections if d["class_name"] == "K" and d["confidence"] > 0.3]
-
-    should_swap = False
-    if white_queens and white_kings:
-        # Project both onto the rank-1 edge. Queen (d-file) should have
-        # a smaller projection than King (e-file) along a1->h1.
-        q_pos = np.array([white_queens[0]["cx"], white_queens[0]["cy"]])
-        k_pos = np.array([white_kings[0]["cx"], white_kings[0]["cy"]])
-        q_proj = np.dot(q_pos - a1_pos, edge_unit)
-        k_proj = np.dot(k_pos - a1_pos, edge_unit)
-        # If Queen projects further along a1->h1 than King, the files are backwards
-        if q_proj > k_proj:
-            should_swap = True
-    elif white_queens:
-        # Queen alone: should be in the a1 half (projection < edge_len/2)
-        q_pos = np.array([white_queens[0]["cx"], white_queens[0]["cy"]])
-        q_proj = np.dot(q_pos - a1_pos, edge_unit)
-        if q_proj > edge_len / 2:
-            should_swap = True
-
-    if should_swap:
-        best_rotation = [h1, h8, a8, a1]
-
-    return np.array(best_rotation, dtype=np.float32)
+    return scored[0][1]

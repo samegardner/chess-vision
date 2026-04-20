@@ -562,9 +562,16 @@ def _run_recording(args, caffeinate_proc):
                     print("Auto-detecting corners...")
                     try:
                         full_dets = detector.detect_raw(calib_frame)
-                        candidate = auto_detect_corners(full_dets, xcorner_det, calib_frame)
+                        # Pass existing corners so labels stay matched to
+                        # current orientation (mid-game position doesn't
+                        # match starting position, so the initial-launch
+                        # scoring would be unreliable here).
+                        candidate = auto_detect_corners(
+                            full_dets, xcorner_det, calib_frame,
+                            existing_corners=corners,
+                        )
                         if candidate is not None:
-                            new_corners = align_to_existing(candidate, corners)
+                            new_corners = candidate
                             shift = float(np.max(np.linalg.norm(new_corners - corners, axis=1)))
                             print(f"Auto-detected corners (max shift {shift:.0f}px).")
                     except Exception as e:
