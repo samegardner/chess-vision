@@ -246,8 +246,10 @@ def main():
     parser = argparse.ArgumentParser(description="Record a chess game")
     parser.add_argument("--camera", type=int, default=0)
     parser.add_argument("--output", type=str, default="game.pgn")
-    parser.add_argument("--select-corners", action="store_true", help="Manually click corners")
-    parser.add_argument("--auto-corners", action="store_true", help="Auto-detect corners from piece positions")
+    parser.add_argument("--select-corners", action="store_true",
+                        help="Force manual corner click; otherwise auto-detect at launch")
+    parser.add_argument("--auto-corners", action="store_true",
+                        help="(Deprecated; auto-detect is now the default)")
     parser.add_argument("--interval", type=float, default=0.05)
     parser.add_argument("--white", type=str, default="White")
     parser.add_argument("--black", type=str, default="Black")
@@ -298,27 +300,41 @@ def _run_recording(args, caffeinate_proc):
         return
     print(f"Camera ready: {frame.shape[1]}x{frame.shape[0]}")
 
-    if args.auto_corners:
-        print("Auto-detecting board corners...")
-        if XCORNERS_MODEL_PATH.exists():
-            xcorner_det = XCornerDetector(str(XCORNERS_MODEL_PATH))
-            dets = detector.detect_raw(frame)
-            corners = auto_detect_corners(dets, xcorner_det, frame)
+    # Load xcorner detector once - reused for initial auto-detect AND C-key
+    # mid-game re-detection.
+    xcorner_det = None
+    if XCORNERS_MODEL_PATH.exists():
+        xcorner_det = XCornerDetector(str(XCORNERS_MODEL_PATH))
+
+    # Corner-selection priority: --select-corners > auto-detect > saved > manual.
+    # Auto-detect is the default at launch because the starting position is
+    # exactly where the Q/K + piece-color heuristics are most reliable, and
+    # using a saved corners.json silently misses board rotations between games.
+    corners = None
+    if args.select_corners:
+        print("Manual corner selection requested. Click a1, a8, h8, h1.")
+        corners = select_corners(frame)
+        CORNERS_FILE.write_text(json.dumps(corners.tolist()))
+    elif xcorner_det is not None:
+        print("Auto-detecting corners (assumes starting position)...")
+        try:
+            init_dets = detector.detect_raw(frame)
+            corners = auto_detect_corners(init_dets, xcorner_det, frame)
             if corners is not None:
-                print(f"  Auto-detected corners: {corners.astype(int).tolist()}")
+                print(f"  Auto-detected: {corners.astype(int).tolist()}")
                 CORNERS_FILE.write_text(json.dumps(corners.tolist()))
             else:
-                print("  Auto-detection failed. Falling back to manual.")
-                print("  Click corners in order: a1, a8, h8, h1")
-                corners = select_corners(frame)
-                CORNERS_FILE.write_text(json.dumps(corners.tolist()))
-        else:
-            print(f"  Xcorners model not found at {XCORNERS_MODEL_PATH}")
-            print("  Falling back to manual selection.")
-            corners = select_corners(frame)
-            CORNERS_FILE.write_text(json.dumps(corners.tolist()))
-    else:
-        corners = load_or_select_corners(frame, force_select=args.select_corners)
+                print("  Auto-detection failed.")
+        except Exception as e:
+            print(f"  Auto-detection error: {e}")
+    if corners is None and CORNERS_FILE.exists():
+        print(f"Falling back to saved corners from {CORNERS_FILE}.")
+        print("  WARNING: if you rotated the board since last game, run with --select-corners.")
+        corners = np.array(json.loads(CORNERS_FILE.read_text()), dtype=np.float32)
+    if corners is None:
+        print("No saved corners. Click a1, a8, h8, h1.")
+        corners = select_corners(frame)
+        CORNERS_FILE.write_text(json.dumps(corners.tolist()))
     square_centers = compute_square_centers(corners, frame.shape)
     crop_region = compute_crop_region(corners)
     board_quad = compute_board_quad(corners)
@@ -385,12 +401,8 @@ def _run_recording(args, caffeinate_proc):
         "draw_debug": [], "cv2_show": [], "loop": [],
     }
 
-    # Load xcorner detector (used only by the C-key auto-recalibration now;
-    # the mid-game periodic recalibration was removed - it always rejected
-    # in practice and cost CPU on every 200th frame).
-    xcorner_det = None
-    if XCORNERS_MODEL_PATH.exists():
-        xcorner_det = XCornerDetector(str(XCORNERS_MODEL_PATH))
+    # xcorner_det was initialized above for the startup auto-detect; reused
+    # here for the C-key mid-game re-detect.
 
     try:
         # Loop runs until user hits Q. After is_game_over() we keep rendering
