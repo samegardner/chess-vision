@@ -22,7 +22,7 @@ from chess_vision.board.detect import select_corners
 from chess_vision.board.auto_corners import auto_detect_corners, XCornerDetector
 from chess_vision.inference.yolo_detect import (
     YoloPieceDetector, compute_square_centers, compute_crop_region,
-    compute_board_quad,
+    compute_board_quad, point_in_quad,
 )
 from chess_vision.event_log import EventLog
 from chess_vision.game.move_scorer import MoveDetectorV2, MoveData, get_move_data, should_undo
@@ -378,7 +378,8 @@ def _run_recording(args, caffeinate_proc):
     # snapshots, averaged and reset each snapshot. Useful to find the
     # bottleneck when FPS is lower than expected.
     timings: dict[str, list[float]] = {
-        "detect_raw": [], "detect_move": [], "draw_debug": [], "loop": [],
+        "read_fresh": [], "detect_raw": [], "detect_move": [],
+        "draw_debug": [], "cv2_show": [], "loop": [],
     }
 
     # Load xcorner detector (used only by the C-key auto-recalibration now;
@@ -392,11 +393,20 @@ def _run_recording(args, caffeinate_proc):
         # Loop runs until user hits Q. After is_game_over() we keep rendering
         # the final position with the GAME OVER overlay so the user can read
         # the result, and we stop pushing moves.
+        # Helper to record loop time exactly once per iteration regardless
+        # of which continue path we take. Call before each continue and at
+        # the natural end. Sets loop_recorded so we don't double-count.
+        def _record_loop():
+            timings["loop"].append(time.monotonic() - loop_start)
+
         while True:
             loop_start = time.monotonic()
 
+            _t0 = time.perf_counter()
             ret, frame = read_fresh(cap)
+            timings["read_fresh"].append(time.perf_counter() - _t0)
             if not ret:
+                _record_loop()
                 continue
 
             game_over = board.is_game_over()
@@ -440,6 +450,38 @@ def _run_recording(args, caffeinate_proc):
                 hand_low_ms = 0.0 if hand_low_start is None else round(
                     (time.monotonic() - hand_low_start) * 1000, 0
                 )
+
+                # Diagnostic: re-run YOLO with a low confidence threshold so
+                # we can see weak detections that the live pipeline filters.
+                # Helps answer "is YOLO seeing the bishop on e2 at 0.18 and
+                # we're throwing it away?" Top 20 by confidence; filter to
+                # detections whose anchor is on or near the board.
+                low_dets = detector.detect_raw(frame, crop_region=crop_region, min_conf=0.05)
+                low_dets.sort(key=lambda d: -d["confidence"])
+                low_summary = []
+                for det in low_dets[:20]:
+                    ax = det["cx"]
+                    ay = det["cy"] + det["h"] / 2 - det["w"] / 3
+                    in_quad = bool(point_in_quad(np.array([ax, ay]), board_quad))
+                    if in_quad:
+                        dists = np.sqrt(
+                            (square_centers[:, 0] - ax) ** 2
+                            + (square_centers[:, 1] - ay) ** 2
+                        )
+                        sq_idx = int(np.argmin(dists))
+                        sq_name = chess.square_name(sq_idx)
+                        sq_dist = float(dists[sq_idx])
+                    else:
+                        sq_name = "off"
+                        sq_dist = -1.0
+                    low_summary.append({
+                        "cls": det["class_name"],
+                        "conf": round(det["confidence"], 3),
+                        "anchor": [round(ax, 0), round(ay, 0)],
+                        "sq": sq_name,
+                        "sq_dist": round(sq_dist, 1),
+                    })
+
                 event_log.log(
                     "snapshot",
                     frame=frame_count,
@@ -458,6 +500,7 @@ def _run_recording(args, caffeinate_proc):
                     expected_pieces=expected_pieces,
                     greedy_pending=greedy_pending,
                     timings_ms={k: _avg_ms(v) for k, v in timings.items()},
+                    low_conf_dets=low_summary,
                 )
                 for bucket in timings.values():
                     bucket.clear()
@@ -469,9 +512,13 @@ def _run_recording(args, caffeinate_proc):
                                    hand_on_board=hand_on_board,
                                    top_candidates=move_detector.top_candidates,
                                    last_fired=move_detector.last_move_san)
-                cv2.imshow("Chess Vision", debug)
                 timings["draw_debug"].append(time.perf_counter() - _t0)
+                _t0 = time.perf_counter()
+                cv2.imshow("Chess Vision", debug)
+                timings["cv2_show"].append(time.perf_counter() - _t0)
+            _t0 = time.perf_counter()
             key = cv2.waitKey(1) & 0xFF
+            timings["cv2_show"].append(time.perf_counter() - _t0)
             if key == ord("q"):
                 break
             elif key == ord("r"):
@@ -527,10 +574,12 @@ def _run_recording(args, caffeinate_proc):
 
             # No more move detection once the game has ended.
             if game_over:
+                _record_loop()
                 continue
 
             # Don't check for moves while hand is on board
             if hand_on_board:
+                _record_loop()
                 continue
 
             # Auto-undo: if last move was greedy and looks wrong, retract it.
@@ -553,6 +602,7 @@ def _run_recording(args, caffeinate_proc):
                     san_history.pop()
                     move_data_history.pop()
                     greedy_pending = False
+                    _record_loop()
                     continue
                 else:
                     event_log.log("confirm", san=last_data.san,
@@ -563,6 +613,7 @@ def _run_recording(args, caffeinate_proc):
             san = move_detector.detect_move(board, detector.state)
             timings["detect_move"].append(time.perf_counter() - _t0)
             if san is None:
+                _record_loop()
                 continue
 
             # Defensive: detector should only return legal SANs, but if cache
@@ -571,6 +622,7 @@ def _run_recording(args, caffeinate_proc):
                 move = board.parse_san(san)
             except (chess.IllegalMoveError, chess.InvalidMoveError, chess.AmbiguousMoveError) as e:
                 print(f"[detect] dropping illegal SAN '{san}': {e}")
+                _record_loop()
                 continue
 
             move_data = get_move_data(board, move)  # capture before push
@@ -586,8 +638,8 @@ def _run_recording(args, caffeinate_proc):
             # Sleep only the remaining time to hit target interval.
             # Record 'loop' BEFORE the sleep so it measures actual work,
             # not wall time (wall time is inferable from snapshot cadence).
+            _record_loop()
             elapsed = time.monotonic() - loop_start
-            timings["loop"].append(elapsed)
             remaining = max(0, args.interval - elapsed)
             if remaining > 0:
                 time.sleep(remaining)

@@ -66,12 +66,18 @@ class YoloPieceDetector:
         self.state = np.zeros((64, 12), dtype=np.float32)
         self.initialized = False
 
-    def detect_raw(self, image: np.ndarray, crop_region: tuple | None = None) -> list[dict]:
+    def detect_raw(self, image: np.ndarray, crop_region: tuple | None = None,
+                   min_conf: float | None = None) -> list[dict]:
         """Run YOLO on an image, return raw detections.
 
         All coordinates returned in original image pixel space.
         No NMS applied (matching ChessCam's approach).
+
+        min_conf overrides self.conf_threshold for this call. Useful for
+        diagnostics - call with a low value (e.g. 0.05) to see weak
+        detections that are normally filtered, without affecting live state.
         """
+        threshold = self.conf_threshold if min_conf is None else min_conf
         offset_x, offset_y = 0, 0
         if crop_region is not None:
             x1, y1, x2, y2 = crop_region
@@ -103,7 +109,7 @@ class YoloPieceDetector:
             all_scores = preds[4:, i]  # 12 class scores
             max_score = float(np.max(all_scores))
 
-            if max_score < self.conf_threshold:
+            if max_score < threshold:
                 continue
 
             # Undo letterbox: remove padding, then unscale
