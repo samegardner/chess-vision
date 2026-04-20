@@ -172,6 +172,50 @@ def test_should_undo_en_passant_fires_when_captured_pawn_still_there():
     assert should_undo(state, data) is True
 
 
+def test_undo_cooldown_blocks_immediate_refire(monkeypatch):
+    """When auto-undo retracts a move and the same SAN scores high again
+    immediately, the cooldown must block re-firing for UNDO_COOLDOWN
+    seconds. Otherwise the joint-vs-single scoring mismatch (e.g. d5
+    after exd5) would cycle fire-undo-fire-undo forever."""
+    import time as time_module
+    fake_now = [1000.0]
+    monkeypatch.setattr(time_module, "time", lambda: fake_now[0])
+
+    detector = MoveDetectorV2(greedy_delay=1.0)
+    state = _make_state_with_starting_position()
+    board = chess.Board()
+    state[chess.E2] = np.zeros(12)
+    state[chess.E4, LABEL_MAP["P"]] = 0.85
+
+    # First call starts the timer; second call past delay fires e4.
+    assert detector.detect_move(board, state) is None
+    fake_now[0] += 1.5
+    assert detector.detect_move(board, state) == "e4"
+
+    # Simulate the main loop: push the move, run detect_move on the new
+    # position to update the cache, then auto-undo pops back. The cache
+    # rebuild on the pop clears last_move_san (matches real flow).
+    board.push_san("e4")
+    fake_now[0] += 0.1
+    detector.detect_move(board, state)  # caches post-e4 fen
+    board.pop()
+    detector.mark_undone("e4")
+
+    # State still looks like e4 was played. last_move_san is cleared
+    # by the cache rebuild on pop, so the only remaining blocker is
+    # the undo cooldown.
+    fake_now[0] += 0.1
+    detector.detect_move(board, state)  # warmup; cache rebuilds, timer set
+    fake_now[0] += 1.5
+    assert detector.detect_move(board, state) is None, (
+        "undo cooldown should block e4 from re-firing right after undo"
+    )
+
+    # Past the cooldown window, e4 fires again.
+    fake_now[0] += MoveDetectorV2.UNDO_COOLDOWN + 1.0
+    assert detector.detect_move(board, state) == "e4"
+
+
 def test_castling_collision_does_not_block_opposite_color(monkeypatch):
     """White "O-O" and black "O-O" share the same SAN literal. After white
     castles, last_move_san = "O-O"; the 'same san as last fire' guard must

@@ -156,6 +156,7 @@ class MoveDetectorV2:
     SCORE_MARGIN = 0.1       # Top move must beat second-best by this much
     TWO_MOVE_DELAY = 0.3     # Time confirmation for two-move detections
     POSSIBLE_MOVE_TTL = 3.0  # Expire possible_moves after this many seconds
+    UNDO_COOLDOWN = 3.0      # Seconds an auto-undone SAN is blocked from re-firing
 
     def __init__(self, greedy_delay: float = 1.0, event_log=None):
         self.possible_moves: dict[str, float] = {}  # san -> last_seen_time
@@ -169,12 +170,27 @@ class MoveDetectorV2:
         # Exposed for the debug HUD so the user can see what the detector is
         # considering even when nothing crosses the firing threshold.
         self.top_candidates: list[tuple[str, float]] = []
+        # Per-SAN cooldowns set when auto-undo retracts a move. Prevents the
+        # joint-vs-single scoring inconsistency from looping the same SAN
+        # forever (e.g. d5 firing repeatedly because joint scoring sees a
+        # white pawn on d5 after a hypothetical capture, while the undo
+        # check looks for a black pawn on d5).
+        self.undo_cooldown: dict[str, float] = {}
         # Optional structured logger; left None means no-op.
         from chess_vision.event_log import NullEventLog
         self.event_log = event_log if event_log is not None else NullEventLog()
 
+    def mark_undone(self, san: str) -> None:
+        """Record that this SAN was just auto-undone. Call from the main
+        loop's undo handler. Prevents the same SAN from re-firing for
+        UNDO_COOLDOWN seconds, which avoids tight fire-undo loops when
+        joint scoring and single-move undo checks disagree."""
+        self.undo_cooldown[san] = time.time() + self.UNDO_COOLDOWN
+
     def detect_move(self, board: chess.Board, state: np.ndarray) -> str | None:
         now = time.time()
+        # Drop expired cooldown entries
+        self.undo_cooldown = {s: t for s, t in self.undo_cooldown.items() if t > now}
 
         # Cache move pairs (only recompute when position changes).
         # Use full FEN: board_fen alone misses en passant + castling rights,
@@ -264,7 +280,8 @@ class MoveDetectorV2:
                 and best_joint_score >= self.MIN_SCORE
                 and best_joint_score - second_joint_score >= self.SCORE_MARGIN
                 and best_combined_san in self.possible_moves
-                and best_combined_san != self.last_move_san):
+                and best_combined_san != self.last_move_san
+                and best_combined_san not in self.undo_cooldown):
             san = best_combined_san
             if san not in self.two_move_times:
                 self.two_move_times[san] = now
@@ -290,7 +307,8 @@ class MoveDetectorV2:
                 and best_score1 >= self.MIN_SCORE
                 and best_score1 - second_score1 >= self.SCORE_MARGIN
                 and best_move.san in self.greedy_times
-                and best_move.san != self.last_move_san):
+                and best_move.san != self.last_move_san
+                and best_move.san not in self.undo_cooldown):
             san = best_move.san
             elapsed = now - self.greedy_times[san]
             if elapsed > self.greedy_delay:

@@ -388,7 +388,8 @@ def _run_recording(args, caffeinate_proc):
     frame_count = 0
     greedy_pending = False
     last_fire_time = 0.0          # time.monotonic() at most recent push
-    UNDO_CHECK_DELAY = 0.5        # seconds after fire before undo check runs
+    UNDO_CHECK_DELAY = 0.5        # seconds after fire before first undo check
+    UNDO_MAX_WINDOW = 3.0         # commit permanently after this many seconds
     HAND_TRIGGER_DELAY = 0.15     # seconds of continuous low-count before freeze
     HAND_RATIO_THRESHOLD = 0.5    # detected < 50% of expected => possible hand
     hand_low_start: float | None = None
@@ -604,10 +605,14 @@ def _run_recording(args, caffeinate_proc):
                 _record_loop()
                 continue
 
-            # Auto-undo: if last move was greedy and looks wrong, retract it.
-            # Uses full MoveData so castling (rook squares) and en passant
-            # (captured pawn square) are checked too, not just king/pawn travel.
-            if (greedy_pending and (time.monotonic() - last_fire_time) >= UNDO_CHECK_DELAY):
+            # Auto-undo: keeps checking the state for UNDO_MAX_WINDOW seconds
+            # after a fire, not just once. Catches sliding moves where the
+            # piece settles past the originally-detected square (e.g. Sam
+            # slid d-pawn through d6 to d5; one-shot undo at 0.5s saw d6
+            # still occupied and confirmed; by the time the slide finished
+            # at d5, undo had already given up). Multi-shot check undoes
+            # whenever the post-fire state looks wrong, until max window.
+            if greedy_pending and (time.monotonic() - last_fire_time) >= UNDO_CHECK_DELAY:
                 last_data = move_data_history[-1]
                 from_occ = max(
                     float(np.max(detector.state[sq])) for sq in last_data.from_squares
@@ -624,12 +629,17 @@ def _run_recording(args, caffeinate_proc):
                     san_history.pop()
                     move_data_history.pop()
                     greedy_pending = False
+                    # Block this SAN from re-firing for UNDO_COOLDOWN seconds
+                    # so we don't loop on a degenerate joint-vs-single mismatch.
+                    move_detector.mark_undone(last_data.san)
                     _record_loop()
                     continue
-                else:
+                elif (time.monotonic() - last_fire_time) >= UNDO_MAX_WINDOW:
+                    # Window expired without undo - commit permanently.
                     event_log.log("confirm", san=last_data.san,
                                   from_occ=round(from_occ, 3), to_occ=round(to_occ, 3))
                     greedy_pending = False
+                # else: stay pending; check again next iteration
 
             _t0 = time.perf_counter()
             san = move_detector.detect_move(board, detector.state)
