@@ -157,6 +157,9 @@ class MoveDetectorV2:
     TWO_MOVE_DELAY = 0.3     # Time confirmation for two-move detections
     POSSIBLE_MOVE_TTL = 3.0  # Expire possible_moves after this many seconds
     UNDO_COOLDOWN = 3.0      # Seconds an auto-undone SAN is blocked from re-firing
+    UNDO_RATE_WINDOW = 10.0  # Sliding window for the cross-SAN undo-rate guard
+    UNDO_RATE_THRESHOLD = 3  # Undos within window that trigger a global freeze
+    UNDO_FREEZE_DURATION = 5.0  # Length of the global firing freeze
 
     def __init__(self, greedy_delay: float = 1.0, event_log=None):
         self.possible_moves: dict[str, float] = {}  # san -> last_seen_time
@@ -176,6 +179,13 @@ class MoveDetectorV2:
         # white pawn on d5 after a hypothetical capture, while the undo
         # check looks for a black pawn on d5).
         self.undo_cooldown: dict[str, float] = {}
+        # Sliding window of recent undo timestamps. When too many undos
+        # happen in a short period, regardless of SAN, ALL firing is
+        # frozen briefly so the user can intervene (e.g. press R to
+        # reset). Catches the case where the system has diverged from
+        # reality and is firing alternating wrong moves.
+        self.recent_undos: list[float] = []
+        self.frozen_until: float = 0.0
         # Optional structured logger; left None means no-op.
         from chess_vision.event_log import NullEventLog
         self.event_log = event_log if event_log is not None else NullEventLog()
@@ -183,14 +193,29 @@ class MoveDetectorV2:
     def mark_undone(self, san: str) -> None:
         """Record that this SAN was just auto-undone. Call from the main
         loop's undo handler. Prevents the same SAN from re-firing for
-        UNDO_COOLDOWN seconds, which avoids tight fire-undo loops when
-        joint scoring and single-move undo checks disagree."""
-        self.undo_cooldown[san] = time.time() + self.UNDO_COOLDOWN
+        UNDO_COOLDOWN seconds, AND triggers a global firing freeze if
+        too many undos have happened recently (catches the case where
+        the system has diverged from reality and keeps firing wrong
+        alternating moves to bypass the per-SAN cooldown)."""
+        now = time.time()
+        self.undo_cooldown[san] = now + self.UNDO_COOLDOWN
+        self.recent_undos.append(now)
+        cutoff = now - self.UNDO_RATE_WINDOW
+        self.recent_undos = [t for t in self.recent_undos if t > cutoff]
+        if len(self.recent_undos) >= self.UNDO_RATE_THRESHOLD:
+            self.frozen_until = now + self.UNDO_FREEZE_DURATION
+            print(f"[detect] firing FROZEN for {self.UNDO_FREEZE_DURATION:.0f}s "
+                  f"({len(self.recent_undos)} undos in {self.UNDO_RATE_WINDOW:.0f}s) - "
+                  f"system likely diverged from reality, press R if needed")
 
     def detect_move(self, board: chess.Board, state: np.ndarray) -> str | None:
         now = time.time()
         # Drop expired cooldown entries
         self.undo_cooldown = {s: t for s, t in self.undo_cooldown.items() if t > now}
+        # Global firing freeze: skip detection entirely. top_candidates
+        # from the previous call stays as-is so the HUD doesn't go blank.
+        if now < self.frozen_until:
+            return None
 
         # Cache move pairs (only recompute when position changes).
         # Use full FEN: board_fen alone misses en passant + castling rights,

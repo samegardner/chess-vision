@@ -216,6 +216,47 @@ def test_undo_cooldown_blocks_immediate_refire(monkeypatch):
     assert detector.detect_move(board, state) == "e4"
 
 
+def test_undo_rate_freeze_blocks_alternating_san_loop(monkeypatch):
+    """Per-SAN cooldown can be bypassed by alternating between two
+    different wrong SANs (e.g. g3, gxf3, g3, gxf3...). The cross-SAN
+    undo-rate guard must freeze ALL firing once enough undos pile up
+    in a short window, regardless of which SANs they were."""
+    import time as time_module
+    fake_now = [1000.0]
+    monkeypatch.setattr(time_module, "time", lambda: fake_now[0])
+
+    detector = MoveDetectorV2()
+    # Manually stack 3 undos within the rate window.
+    detector.mark_undone("g3")
+    fake_now[0] += 1.0
+    detector.mark_undone("gxf3")
+    fake_now[0] += 1.0
+    detector.mark_undone("g3")  # this third undo crosses the threshold
+
+    # Freeze must now be active.
+    assert detector.frozen_until > fake_now[0]
+
+    # detect_move with any state must return None while frozen, even if
+    # the score for some legal move is high.
+    state = _make_state_with_starting_position()
+    board = chess.Board()
+    state[chess.E2] = np.zeros(12)
+    state[chess.E4, LABEL_MAP["P"]] = 0.85
+    fake_now[0] += 1.0
+    assert detector.detect_move(board, state) is None
+    fake_now[0] += 1.0
+    assert detector.detect_move(board, state) is None
+
+    # After the freeze expires, normal firing resumes.
+    fake_now[0] += MoveDetectorV2.UNDO_FREEZE_DURATION + 1.0
+    detector.detect_move(board, state)  # warmup
+    fake_now[0] += MoveDetectorV2.UNDO_COOLDOWN + 2.0
+    fake_now[0] += 1.5
+    # e4 has no cooldown of its own, so it should fire eventually.
+    result = detector.detect_move(board, state)
+    assert result == "e4", f"expected e4 to fire post-freeze, got {result!r}"
+
+
 def test_castling_collision_does_not_block_opposite_color(monkeypatch):
     """White "O-O" and black "O-O" share the same SAN literal. After white
     castles, last_move_san = "O-O"; the 'same san as last fire' guard must

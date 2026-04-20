@@ -101,7 +101,8 @@ def _game_over_text(board: chess.Board) -> str | None:
 
 
 def draw_debug(frame, detections, square_centers, board, san_history, corners,
-               hand_on_board=False, top_candidates=None, last_fired=""):
+               hand_on_board=False, top_candidates=None, last_fired="",
+               frozen_remaining=0.0):
     """Draw debug overlay. san_history is a pre-built list of SAN strings.
 
     top_candidates: optional list of (san, score) tuples (best first) from
@@ -158,6 +159,9 @@ def draw_debug(frame, detections, square_centers, board, san_history, corners,
         cv2.putText(panel, over_text, (15, 125), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
     elif hand_on_board:
         cv2.putText(panel, "HAND DETECTED", (15, 125), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+    elif frozen_remaining > 0:
+        cv2.putText(panel, f"FROZEN {frozen_remaining:.0f}s (R to reset)", (15, 125),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
 
     # Top-3 candidates HUD (lets the user see what the detector is "thinking"
     # even when nothing crosses the firing threshold). Each line:
@@ -524,10 +528,12 @@ def _run_recording(args, caffeinate_proc):
             # Draw debug every 3rd frame
             if not args.no_display and frame_count % 3 == 0:
                 _t0 = time.perf_counter()
+                frozen_remaining = max(0.0, move_detector.frozen_until - time.time())
                 debug = draw_debug(frame, dets, square_centers, board, san_history, corners,
                                    hand_on_board=hand_on_board,
                                    top_candidates=move_detector.top_candidates,
-                                   last_fired=move_detector.last_move_san)
+                                   last_fired=move_detector.last_move_san,
+                                   frozen_remaining=frozen_remaining)
                 timings["draw_debug"].append(time.perf_counter() - _t0)
                 _t0 = time.perf_counter()
                 cv2.imshow("Chess Vision", debug)
