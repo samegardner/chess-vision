@@ -2,6 +2,10 @@
 
 Record over-the-board chess games using a USB camera. Outputs PGN files you can import into Chess.com, Lichess, or any chess engine for analysis.
 
+## Demo
+
+https://github.com/samegardner/chess-vision/raw/main/assets/demo.mp4
+
 ## How it works
 
 Point a camera at your chessboard, click the four corners, and play. The software detects moves in real-time using computer vision and saves the game as a PGN file.
@@ -11,6 +15,7 @@ Point a camera at your chessboard, click the four corners, and play. The softwar
 - **Two-move lookahead** for reliable move detection
 - **Hand detection** pauses tracking when your hand is over the board
 - **Auto-undo** retracts false positive detections
+- **Overshoot rescue** confirms a move and pushes the next one when the player plays both before the bot can confirm
 - **Checkmate/game-over detection** via python-chess
 
 ## Quick start

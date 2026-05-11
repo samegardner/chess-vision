@@ -39,3 +39,6 @@ training.log
 
 # Environment
 .env
+
+# Local board calibration (per-user, per-setup)
+corners.json
