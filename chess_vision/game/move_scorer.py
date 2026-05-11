@@ -65,6 +65,19 @@ def get_move_data(board: chess.Board, move: chess.Move) -> MoveData:
 
 
 def combine_data(move1: MoveData, move2: MoveData) -> MoveData:
+    """Build the MoveData representing the COMBINED end state of move1+move2.
+
+    Filtering move2.from_squares against move1.to_squares: in the en-passant-
+    of-move1 case (e.g. white plays c4, black plays dxc3 capturing c4), move2's
+    from_squares contains move1.to_square (c4) as the en-passant captured
+    square. Including it as a combined from-square gives a free "this square
+    is empty" reward (+0.55 in calculate_score) that biases the scorer toward
+    the en-passant interpretation. With it filtered, c4+dxc3 e.p. and
+    c3+dxc3 produce the same combined data, matching the fact that their
+    final positions are identical and the bot can't tell them apart from
+    image data alone. Tie-breaking is handled in get_move_pairs.
+    """
+    move1_to_set = set(move1.to_squares)
     bad_squares = set(move2.from_squares + move2.to_squares)
     from1 = [sq for sq in move1.from_squares if sq not in bad_squares]
     to1, targets1 = [], []
@@ -72,30 +85,74 @@ def combine_data(move1: MoveData, move2: MoveData) -> MoveData:
         if sq not in bad_squares:
             to1.append(sq)
             targets1.append(move1.targets[i])
+    move2_from = [sq for sq in move2.from_squares if sq not in move1_to_set]
 
     return MoveData(
         san=move1.san,
-        from_squares=from1 + move2.from_squares,
+        from_squares=from1 + move2_from,
         to_squares=to1 + move2.to_squares,
         targets=targets1 + move2.targets,
     )
 
 
+def _pair_signature(pair: MovePair) -> tuple:
+    """Hashable signature of a pair's combined end state.
+
+    Two pairs with the same signature lead to identical observable board
+    states, so the YOLO state matrix can't distinguish them. Used to
+    deduplicate equivalent pairs (notably c3+dxc3 vs c4+dxc3 e.p.).
+    """
+    c = pair.combined
+    if c is None:
+        return ()
+    return (
+        frozenset(c.from_squares),
+        tuple(sorted(zip(c.to_squares, c.targets))),
+    )
+
+
 def get_move_pairs(board: chess.Board) -> list[MovePair]:
+    """Generate move-pair candidates for two-move lookahead scoring.
+
+    Pairs whose combined end-state is observationally identical are deduped,
+    keeping the FIRST emitted (which by python-chess iteration order is the
+    simpler interpretation - e.g. c3+dxc3 over c4+dxc3 e.p.). Without dedup,
+    equivalent pairs split the joint-score margin so neither can fire, and
+    the bot stalls.
+    """
     pairs = []
     for move1 in board.legal_moves:
         move1_data = get_move_data(board, move1)
         board.push(move1)
         has_response = False
+        seen_signatures: set = set()
         for move2 in board.legal_moves:
             move2_data = get_move_data(board, move2)
             combined = combine_data(move1_data, move2_data)
-            pairs.append(MovePair(move1=move1_data, move2=move2_data, combined=combined))
+            pair = MovePair(move1=move1_data, move2=move2_data, combined=combined)
+            sig = _pair_signature(pair)
+            if sig in seen_signatures:
+                continue
+            seen_signatures.add(sig)
+            pairs.append(pair)
             has_response = True
         board.pop()
         if not has_response:
             pairs.append(MovePair(move1=move1_data, move2=None, combined=None))
-    return pairs
+    # Cross-move1 dedup: two pairs with different move1 but identical combined
+    # end-state are observationally equivalent (the c3+dxc3 / c4+dxc3 e.p.
+    # case). Keep the first one emitted, which by iteration order is the
+    # simpler interpretation (c3 before c4).
+    deduped = []
+    seen_cross: set = set()
+    for pair in pairs:
+        sig = _pair_signature(pair)
+        if sig and sig in seen_cross:
+            continue
+        if sig:
+            seen_cross.add(sig)
+        deduped.append(pair)
+    return deduped
 
 
 def should_undo(state: np.ndarray, move: MoveData,

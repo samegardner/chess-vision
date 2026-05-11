@@ -25,7 +25,9 @@ from chess_vision.inference.yolo_detect import (
     compute_board_quad, point_in_quad,
 )
 from chess_vision.event_log import EventLog
-from chess_vision.game.move_scorer import MoveDetectorV2, MoveData, get_move_data, should_undo
+from chess_vision.game.move_scorer import (
+    MoveDetectorV2, MoveData, calculate_score, get_move_data, should_undo,
+)
 from chess_vision.game.pgn import generate_pgn, save_pgn
 
 CORNERS_FILE = Path(__file__).parent.parent / "corners.json"
@@ -397,6 +399,8 @@ def _run_recording(args, caffeinate_proc):
     HAND_TRIGGER_DELAY = 0.15     # seconds of continuous low-count before freeze
     HAND_RATIO_THRESHOLD = 0.5    # detected < 50% of expected => possible hand
     hand_low_start: float | None = None
+    hand_on_board_prev = False    # for logging hand state transitions
+    quit_reason = "loop_exit"     # overwritten by Q-key handler or KeyboardInterrupt
 
     # Timing buckets for the debug HUD snapshot. Accumulated between
     # snapshots, averaged and reset each snapshot. Useful to find the
@@ -453,6 +457,11 @@ def _run_recording(args, caffeinate_proc):
             else:
                 hand_low_start = None
                 hand_on_board = False
+
+            if hand_on_board != hand_on_board_prev:
+                event_log.log("hand_state", on_board=hand_on_board,
+                              detected=detected_pieces, expected=expected_pieces)
+                hand_on_board_prev = hand_on_board
 
             if not hand_on_board:
                 detector.update_state(update)
@@ -542,8 +551,25 @@ def _run_recording(args, caffeinate_proc):
             key = cv2.waitKey(1) & 0xFF
             timings["cv2_show"].append(time.perf_counter() - _t0)
             if key == ord("q"):
+                discarded_san = ""
+                # An unconfirmed move at quit time is almost certainly a
+                # phantom from the user's hand crossing the board to reach
+                # the keyboard. Drop it before saving the PGN.
+                if greedy_pending and move_data_history:
+                    discarded_san = move_data_history[-1].san
+                    board.pop()
+                    move_history.pop()
+                    san_history.pop()
+                    move_data_history.pop()
+                    greedy_pending = False
+                event_log.log("keypress", key="q", action="quit",
+                              greedy_pending_at_quit=(discarded_san != ""),
+                              discarded_san=discarded_san)
+                quit_reason = "user_quit_q"
                 break
             elif key == ord("r"):
+                event_log.log("keypress", key="r", action="reset",
+                              moves_at_reset=len(move_history))
                 # Reset: clear all moves, restart from beginning
                 board = chess.Board()
                 move_history.clear()
@@ -557,6 +583,7 @@ def _run_recording(args, caffeinate_proc):
                 detector.state = np.zeros((64, 12), dtype=np.float32)
                 detector.initialized = False
             elif key == ord("c"):
+                event_log.log("keypress", key="c", action="recalibrate")
                 # Re-detect corners mid-game. Try auto first; fall back to
                 # manual click if auto fails or isn't available. Auto-corners
                 # returns a guess that may be in the wrong rotation, so we
@@ -628,6 +655,47 @@ def _run_recording(args, caffeinate_proc):
                     for i, sq in enumerate(last_data.to_squares)
                 )
                 if should_undo(detector.state, last_data):
+                    # Overshoot rescue: should_undo can trip not only because
+                    # the fired move was wrong, but because the player has
+                    # already played the NEXT move on top of it. Example:
+                    # after 3.c3, Sam played dxc3 then immediately Nxc3 -
+                    # the bot fired dxc3 correctly, but by the time the
+                    # confirm check ran, c3 was occupied by a white knight,
+                    # not a black pawn, so should_undo tripped and the loop
+                    # never advanced past move 3.
+                    # Before undoing, probe whether state strongly matches
+                    # a position one ply ahead. If so, confirm the current
+                    # move and push the rescued move instead of undoing.
+                    rescue_data: MoveData | None = None
+                    rescue_score = float("-inf")
+                    second_score = float("-inf")
+                    for move2 in board.legal_moves:
+                        d2 = get_move_data(board, move2)
+                        s2 = calculate_score(detector.state, d2)
+                        if s2 > rescue_score:
+                            second_score = rescue_score
+                            rescue_score = s2
+                            rescue_data = d2
+                        elif s2 > second_score:
+                            second_score = s2
+                    if (rescue_data is not None
+                            and rescue_score >= MoveDetectorV2.MIN_SCORE
+                            and rescue_score - second_score >= MoveDetectorV2.SCORE_MARGIN):
+                        rescue_move = board.parse_san(rescue_data.san)
+                        event_log.log("rescue",
+                                      confirmed=last_data.san,
+                                      pushed=rescue_data.san,
+                                      score=round(rescue_score, 3),
+                                      margin=round(rescue_score - second_score, 3))
+                        board.push(rescue_move)
+                        move_history.append(rescue_move)
+                        san_history.append(rescue_data.san)
+                        move_data_history.append(rescue_data)
+                        last_fire_time = time.monotonic()
+                        # greedy_pending stays True; pending on rescued move now.
+                        _record_loop()
+                        continue
+
                     event_log.log("undo", san=last_data.san,
                                   from_occ=round(from_occ, 3), to_occ=round(to_occ, 3))
                     board.pop()
@@ -683,11 +751,13 @@ def _run_recording(args, caffeinate_proc):
                 time.sleep(remaining)
 
     except KeyboardInterrupt:
+        quit_reason = "keyboard_interrupt"
         print("\n\nStopped.")
     finally:
         event_log.log("session_end", moves=len(move_history),
                       final_fen=board.fen(),
-                      game_over=board.is_game_over())
+                      game_over=board.is_game_over(),
+                      reason=quit_reason)
         event_log.close()
         cap.release()
         if not args.no_display:
